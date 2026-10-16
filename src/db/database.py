@@ -2,7 +2,7 @@ import os
 import re
 from dotenv import load_dotenv
 from src.models.Job import Job
-from src.db.models import Job as DBJob, Base
+from src.db.models import Job as DBJob, Base, JobDescription
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
@@ -41,6 +41,13 @@ async def sync_jobs(jobs_list: list[Job]) -> list[DBJob]:
     async with Session() as session:
         result = await session.execute(stmt)
         rows = result.scalars().all()
+        if rows:
+            stmt = insert(JobDescription).values([{"job_id": job.id} for job in rows])
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[JobDescription.job_id],
+                set_={"status": 'pending'}
+            )
+            await session.execute(stmt)
         await session.commit()
     return rows
     

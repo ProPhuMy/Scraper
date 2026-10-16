@@ -27,6 +27,7 @@ class Job(Base):
     date_updated: Mapped[int] = mapped_column()
 
     requirements: Mapped[list[Requirement]] = relationship(back_populates='job', cascade= "all, delete-orphan")
+    description: Mapped[JobDescription | None] = relationship(back_populates='job', cascade= "all, delete-orphan")
     # eligibility
 
 class Requirement(Base):
@@ -36,3 +37,15 @@ class Requirement(Base):
     job_id: Mapped[int] = mapped_column(ForeignKey('jobs.id'))
 
     job: Mapped[Job] = relationship(back_populates='requirements')
+
+class JobDescription(Base):
+    __tablename__ = "descriptions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey('jobs.id'), unique=True)
+    status: Mapped[str] = mapped_column(server_default='pending')
+
+    text: Mapped[str | None] = mapped_column(nullable=True)
+    text_hash: Mapped[str | None] = mapped_column(nullable=True)
+    fetched_at: Mapped[int | None] = mapped_column(nullable=True)
+    job: Mapped[Job] = relationship(back_populates='description') 
