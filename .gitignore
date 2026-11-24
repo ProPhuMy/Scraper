@@ -3,3 +3,9 @@ __pycache__/
 test.py
 .env
 internship_filter_architecture_notes.md
+
+# Added by cargo
+
+/target
+scraper.db*
+scraper.toml
