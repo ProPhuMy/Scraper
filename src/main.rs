@@ -17,11 +17,11 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(name = "scraper", about = "Internship eligibility fetcher CLI")]
 pub struct Cli {
-    #[arg(long, global = true, default_value = "scraper.toml")]
-    pub config: PathBuf,
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
 
-    #[arg(long, global = true, default_value = "scraper.db")]
-    pub db: PathBuf,
+    #[arg(long, global = true)]
+    pub db: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -29,6 +29,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    Init,
     Sync,
     Scan {
         #[arg(long)]
@@ -58,14 +59,53 @@ pub enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if let Commands::Init = cli.command {
+        let home_dir = config::home_config_dir().ok_or_else(|| {
+            anyhow::anyhow!("could not determine home config directory (APPDATA or HOME not set)")
+        })?;
+        let report = config::init(&home_dir)?;
+        let abs_config = std::path::absolute(&report.config_path).unwrap_or(report.config_path);
+        let abs_env = std::path::absolute(&report.env_path).unwrap_or(report.env_path);
+
+        if report.config_created {
+            println!("created {}", abs_config.display());
+        } else {
+            println!("config already exists: {}", abs_config.display());
+        }
+
+        if report.env_created {
+            println!("created {}", abs_env.display());
+        } else {
+            println!(".env already exists: {}", abs_env.display());
+        }
+
+        println!("  edit your profile:   {}", abs_config.display());
+        println!("  optional LLM key:    uncomment LLM_API_KEY in {}", abs_env.display());
+        println!("  then run:            scraper sync && scraper scan && scraper browse");
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()?;
+    let home_dir = config::home_config_dir();
+    let config_path =
+        config::resolve_config_path(cli.config.as_deref(), &cwd, home_dir.as_deref())?;
+    let db_path = config::resolve_db_path(cli.db.as_deref(), &config_path);
+
+    if let Some(config_dir) = config_path.parent() {
+        let env_path = config_dir.join(".env");
+        dotenvy::from_path(&env_path).ok();
+    }
+
+    let cfg = config::load(&config_path)?;
+
     match cli.command {
+        Commands::Init => unreachable!(),
         Commands::Sync => {
-            let cfg = config::load(&cli.config)?;
-            commands::sync(&cfg, &cli.db).await
+            commands::sync(&cfg, &db_path).await
         }
         Commands::Scan { limit, no_llm } => {
-            let cfg = config::load(&cli.config)?;
-            commands::scan(&cfg, &cli.db, limit, no_llm).await
+            commands::scan(&cfg, &db_path, limit, no_llm).await
         }
         Commands::List {
             year,
@@ -76,10 +116,9 @@ async fn main() -> anyhow::Result<()> {
             applied,
             new,
         } => {
-            let cfg = config::load(&cli.config)?;
             verdict::list(
                 &cfg,
-                &cli.db,
+                &db_path,
                 year,
                 verdict,
                 all,
@@ -90,8 +129,7 @@ async fn main() -> anyhow::Result<()> {
             )
         }
         Commands::Browse => {
-            let cfg = config::load(&cli.config)?;
-            tui::run(&cfg, &cli.db)
+            tui::run(&cfg, &db_path)
         }
     }
 }
