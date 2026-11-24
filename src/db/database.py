@@ -3,6 +3,7 @@ import re
 from dotenv import load_dotenv
 from src.models.Job import Job
 from src.db.models import Job as DBJob, Base, JobDescription
+from sqlalchemy.engine import Row
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
@@ -15,7 +16,7 @@ async def initDB():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-async def sync_jobs(jobs_list: list[Job]) -> list[DBJob]:
+async def sync_jobs(jobs_list: list[Job]) -> int:
     if not jobs_list:
         return []
     
@@ -36,13 +37,13 @@ async def sync_jobs(jobs_list: list[Job]) -> list[DBJob]:
             "date_updated": stmt.excluded.date_updated
             },
         where=stmt.excluded.date_updated > DBJob.date_updated
-    ).returning(DBJob)
+    ).returning(DBJob.id)
     
     async with Session() as session:
         result = await session.execute(stmt)
         rows = result.scalars().all()
         if rows:
-            stmt = insert(JobDescription).values([{"job_id": job.id} for job in rows])
+            stmt = insert(JobDescription).values([{"job_id": id} for id in rows])
             stmt = stmt.on_conflict_do_update(
                 index_elements=[JobDescription.job_id],
                 set_={"status": 'pending'}
@@ -50,4 +51,3 @@ async def sync_jobs(jobs_list: list[Job]) -> list[DBJob]:
             await session.execute(stmt)
         await session.commit()
     return rows
-    
