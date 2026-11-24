@@ -6,6 +6,7 @@ mod text;
 mod simplify;
 mod portals;
 mod verdict;
+mod llm;
 
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
