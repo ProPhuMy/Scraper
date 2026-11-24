@@ -1,12 +1,47 @@
+use std::collections::HashSet;
 use crate::config::{Config, Profile};
 use crate::db::{now_unix, Marks, Row};
-use crate::views::{build_view, toggle, MarkKey, Tab, VerdictFilter, ViewRow};
+use crate::verdict::Verdict;
+use crate::views::{
+    build_view, group_view, merge_locations, toggle_many, LocRow, MarkKey, Tab,
+    VerdictFilter, ViewRow,
+};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    SaveMarks { job_id: i64, marks: Marks },
+    SaveMarks(Vec<(i64, Marks)>),
     OpenUrl(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Line {
+    Plain(usize),
+    Header(usize),
+    Child(usize, usize),
+}
+
+pub fn group_key(company: &str, title: &str, verdict: Verdict) -> String {
+    let v_str = match verdict {
+        Verdict::Apply => "apply",
+        Verdict::Maybe => "maybe",
+        Verdict::No => "no",
+    };
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        company.trim().to_lowercase(),
+        title.trim().to_lowercase(),
+        v_str
+    )
+}
+
+pub fn group_key_from_loc(loc: &LocRow) -> String {
+    let newest = loc.newest();
+    group_key(
+        &newest.row.job.company,
+        &newest.row.job.title,
+        newest.judgement.verdict,
+    )
 }
 
 pub struct App {
@@ -22,6 +57,8 @@ pub struct App {
     pub quit: bool,
     pub season_year: u16,
     pub profile: Profile,
+    pub expanded: HashSet<String>,
+    pub lines: Vec<Line>,
 }
 
 impl App {
@@ -39,7 +76,10 @@ impl App {
             quit: false,
             season_year: cfg.season_year,
             profile: cfg.profile.clone(),
+            expanded: HashSet::new(),
+            lines: Vec::new(),
         };
+        app.rebuild_lines();
         app.clamp_selected();
         app
     }
@@ -58,8 +98,37 @@ impl App {
         )
     }
 
+    pub fn lines(&self) -> Vec<Line> {
+        let view = self.visible_rows();
+        let loc_rows = merge_locations(view);
+        if self.tab == Tab::Jobs {
+            let groups = group_view(loc_rows);
+            let mut lines = Vec::new();
+            for (g_idx, group) in groups.iter().enumerate() {
+                if group.rows.len() == 1 {
+                    lines.push(Line::Plain(g_idx));
+                } else {
+                    lines.push(Line::Header(g_idx));
+                    let key = group_key_from_loc(&group.rows[0]);
+                    if self.expanded.contains(&key) {
+                        for loc_idx in 0..group.rows.len() {
+                            lines.push(Line::Child(g_idx, loc_idx));
+                        }
+                    }
+                }
+            }
+            lines
+        } else {
+            (0..loc_rows.len()).map(Line::Plain).collect()
+        }
+    }
+
+    pub fn rebuild_lines(&mut self) {
+        self.lines = self.lines();
+    }
+
     pub fn clamp_selected(&mut self) {
-        let len = self.visible_rows().len();
+        let len = self.lines.len();
         if len == 0 {
             self.selected = 0;
         } else if self.selected >= len {
@@ -71,6 +140,9 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+
+        self.rebuild_lines();
+        self.clamp_selected();
 
         // Ctrl-C arrives as a key event in raw mode: quit
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -92,22 +164,21 @@ impl App {
             match key.code {
                 KeyCode::Char(c) => {
                     self.search.push(c);
+                    self.rebuild_lines();
                     self.clamp_selected();
                 }
                 KeyCode::Backspace => {
                     self.search.pop();
+                    self.rebuild_lines();
                     self.clamp_selected();
                 }
                 KeyCode::Enter => {
                     self.searching = false;
                 }
                 KeyCode::Esc => {
-                    if self.search.is_empty() {
-                        self.searching = false;
-                    } else {
-                        self.search.clear();
-                        self.searching = false;
-                    }
+                    self.search.clear();
+                    self.searching = false;
+                    self.rebuild_lines();
                     self.clamp_selected();
                 }
                 _ => {}
@@ -132,6 +203,7 @@ impl App {
             KeyCode::Esc => {
                 if !self.search.is_empty() {
                     self.search.clear();
+                    self.rebuild_lines();
                     self.clamp_selected();
                 }
                 None
@@ -141,7 +213,7 @@ impl App {
                 None
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let len = self.visible_rows().len();
+                let len = self.lines.len();
                 if len > 0 && self.selected + 1 < len {
                     self.selected += 1;
                 }
@@ -152,7 +224,7 @@ impl App {
                 None
             }
             KeyCode::PageDown => {
-                let len = self.visible_rows().len();
+                let len = self.lines.len();
                 if len > 0 {
                     self.selected = (self.selected + 10).min(len - 1);
                 }
@@ -163,7 +235,7 @@ impl App {
                 None
             }
             KeyCode::End | KeyCode::Char('G') => {
-                let len = self.visible_rows().len();
+                let len = self.lines.len();
                 self.selected = len.saturating_sub(1);
                 None
             }
@@ -175,6 +247,7 @@ impl App {
                     Tab::Hidden => Tab::Jobs,
                 };
                 self.status_msg = None;
+                self.rebuild_lines();
                 self.clamp_selected();
                 None
             }
@@ -186,6 +259,7 @@ impl App {
                     Tab::Starred => Tab::Jobs,
                 };
                 self.status_msg = None;
+                self.rebuild_lines();
                 self.clamp_selected();
                 None
             }
@@ -193,6 +267,7 @@ impl App {
                 if self.tab == Tab::Jobs {
                     self.filter = VerdictFilter::Apply;
                     self.status_msg = None;
+                    self.rebuild_lines();
                     self.clamp_selected();
                 } else {
                     self.status_msg = Some("verdict filter only applies to Jobs tab".to_string());
@@ -203,6 +278,7 @@ impl App {
                 if self.tab == Tab::Jobs {
                     self.filter = VerdictFilter::Maybe;
                     self.status_msg = None;
+                    self.rebuild_lines();
                     self.clamp_selected();
                 } else {
                     self.status_msg = Some("verdict filter only applies to Jobs tab".to_string());
@@ -213,6 +289,7 @@ impl App {
                 if self.tab == Tab::Jobs {
                     self.filter = VerdictFilter::No;
                     self.status_msg = None;
+                    self.rebuild_lines();
                     self.clamp_selected();
                 } else {
                     self.status_msg = Some("verdict filter only applies to Jobs tab".to_string());
@@ -223,6 +300,7 @@ impl App {
                 if self.tab == Tab::Jobs {
                     self.filter = VerdictFilter::All;
                     self.status_msg = None;
+                    self.rebuild_lines();
                     self.clamp_selected();
                 } else {
                     self.status_msg = Some("verdict filter only applies to Jobs tab".to_string());
@@ -231,18 +309,123 @@ impl App {
             }
             KeyCode::Char('y') => {
                 self.class_year = if self.class_year >= 4 { 1 } else { self.class_year + 1 };
+                self.rebuild_lines();
                 self.clamp_selected();
+                None
+            }
+            KeyCode::Enter => {
+                if self.tab == Tab::Jobs {
+                    let view = self.visible_rows();
+                    let loc_rows = merge_locations(view);
+                    let groups = group_view(loc_rows);
+                    if let Some(&line) = self.lines.get(self.selected) {
+                        match line {
+                            Line::Header(g_idx) => {
+                                let key = group_key_from_loc(&groups[g_idx].rows[0]);
+                                if self.expanded.contains(&key) {
+                                    self.expanded.remove(&key);
+                                } else {
+                                    self.expanded.insert(key);
+                                }
+                                self.rebuild_lines();
+                                if let Some(pos) = self.lines.iter().position(|l| matches!(l, Line::Header(g) if *g == g_idx)) {
+                                    self.selected = pos;
+                                }
+                                self.clamp_selected();
+                            }
+                            Line::Child(g_idx, _) => {
+                                let key = group_key_from_loc(&groups[g_idx].rows[0]);
+                                self.expanded.remove(&key);
+                                self.rebuild_lines();
+                                if let Some(pos) = self.lines.iter().position(|l| matches!(l, Line::Header(g) if *g == g_idx)) {
+                                    self.selected = pos;
+                                }
+                                self.clamp_selected();
+                            }
+                            Line::Plain(_) => {}
+                        }
+                    }
+                }
+                None
+            }
+            KeyCode::Right => {
+                if self.tab == Tab::Jobs {
+                    let view = self.visible_rows();
+                    let loc_rows = merge_locations(view);
+                    let groups = group_view(loc_rows);
+                    if let Some(&Line::Header(g_idx)) = self.lines.get(self.selected) {
+                        let key = group_key_from_loc(&groups[g_idx].rows[0]);
+                        if !self.expanded.contains(&key) {
+                            self.expanded.insert(key);
+                            self.rebuild_lines();
+                            if let Some(pos) = self.lines.iter().position(|l| matches!(l, Line::Header(g) if *g == g_idx)) {
+                                self.selected = pos;
+                            }
+                            self.clamp_selected();
+                        }
+                    }
+                }
+                None
+            }
+            KeyCode::Left => {
+                if self.tab == Tab::Jobs {
+                    let view = self.visible_rows();
+                    let loc_rows = merge_locations(view);
+                    let groups = group_view(loc_rows);
+                    if let Some(&line) = self.lines.get(self.selected) {
+                        match line {
+                            Line::Header(g_idx) => {
+                                let key = group_key_from_loc(&groups[g_idx].rows[0]);
+                                if self.expanded.contains(&key) {
+                                    self.expanded.remove(&key);
+                                    self.rebuild_lines();
+                                    if let Some(pos) = self.lines.iter().position(|l| matches!(l, Line::Header(g) if *g == g_idx)) {
+                                        self.selected = pos;
+                                    }
+                                    self.clamp_selected();
+                                }
+                            }
+                            Line::Child(g_idx, _) => {
+                                let key = group_key_from_loc(&groups[g_idx].rows[0]);
+                                self.expanded.remove(&key);
+                                self.rebuild_lines();
+                                if let Some(pos) = self.lines.iter().position(|l| matches!(l, Line::Header(g) if *g == g_idx)) {
+                                    self.selected = pos;
+                                }
+                                self.clamp_selected();
+                            }
+                            Line::Plain(_) => {}
+                        }
+                    }
+                }
                 None
             }
             KeyCode::Char('s') => self.toggle_mark(MarkKey::Star),
             KeyCode::Char('h') => self.toggle_mark(MarkKey::Hide),
             KeyCode::Char('a') => self.toggle_mark(MarkKey::Applied),
             KeyCode::Char('o') => {
-                let visible = self.visible_rows();
-                if let Some(vr) = visible.get(self.selected) {
-                    Some(Action::OpenUrl(vr.row.job.url.clone()))
-                } else {
-                    None
+                let view = self.visible_rows();
+                let loc_rows = merge_locations(view);
+                match self.lines.get(self.selected) {
+                    Some(Line::Header(_)) => {
+                        self.status_msg = Some("press Enter to pick a location".to_string());
+                        None
+                    }
+                    Some(Line::Child(g_idx, loc_idx)) => {
+                        let groups = group_view(loc_rows);
+                        let url = groups.get(*g_idx)?.rows.get(*loc_idx)?.newest().row.job.url.clone();
+                        Some(Action::OpenUrl(url))
+                    }
+                    Some(Line::Plain(idx)) => {
+                        let url = if self.tab == Tab::Jobs {
+                            let groups = group_view(loc_rows);
+                            groups.get(*idx)?.rows.get(0)?.newest().row.job.url.clone()
+                        } else {
+                            loc_rows.get(*idx)?.newest().row.job.url.clone()
+                        };
+                        Some(Action::OpenUrl(url))
+                    }
+                    None => None,
                 }
             }
             _ => None,
@@ -250,23 +433,57 @@ impl App {
     }
 
     fn toggle_mark(&mut self, key: MarkKey) -> Option<Action> {
-        let visible = self.visible_rows();
-        let vr = visible.get(self.selected)?;
-        let job_id = vr.row.job.id;
-        let old_marks = vr.row.marks;
-        let now = now_unix();
+        let selected_line = *self.lines.get(self.selected)?;
 
-        match toggle(old_marks, key, now) {
-            Ok(new_marks) => {
-                self.status_msg = None;
-                if let Some(row) = self.rows.iter_mut().find(|r| r.job.id == job_id) {
-                    row.marks = new_marks;
+        let (current_marks, job_ids) = match selected_line {
+            Line::Header(_) => {
+                self.status_msg = Some("press Enter to pick a location".to_string());
+                return None;
+            }
+            Line::Child(g_idx, loc_idx) => {
+                let view = self.visible_rows();
+                let loc_rows = merge_locations(view);
+                let groups = group_view(loc_rows);
+                let loc_row = groups.get(g_idx)?.rows.get(loc_idx)?;
+                (
+                    loc_row.members.iter().map(|m| m.row.marks).collect::<Vec<_>>(),
+                    loc_row.job_ids(),
+                )
+            }
+            Line::Plain(idx) => {
+                let view = self.visible_rows();
+                let loc_rows = merge_locations(view);
+                if self.tab == Tab::Jobs {
+                    let groups = group_view(loc_rows);
+                    let loc_row = groups.get(idx)?.rows.get(0)?;
+                    (
+                        loc_row.members.iter().map(|m| m.row.marks).collect::<Vec<_>>(),
+                        loc_row.job_ids(),
+                    )
+                } else {
+                    let loc_row = loc_rows.get(idx)?;
+                    (
+                        loc_row.members.iter().map(|m| m.row.marks).collect::<Vec<_>>(),
+                        loc_row.job_ids(),
+                    )
                 }
+            }
+        };
+
+        let now = now_unix();
+        match toggle_many(&current_marks, key, now) {
+            Ok(new_marks_vec) => {
+                self.status_msg = None;
+                let mut save_marks = Vec::with_capacity(job_ids.len());
+                for (job_id, new_marks) in job_ids.into_iter().zip(new_marks_vec) {
+                    save_marks.push((job_id, new_marks));
+                    if let Some(row) = self.rows.iter_mut().find(|r| r.job.id == job_id) {
+                        row.marks = new_marks;
+                    }
+                }
+                self.rebuild_lines();
                 self.clamp_selected();
-                Some(Action::SaveMarks {
-                    job_id,
-                    marks: new_marks,
-                })
+                Some(Action::SaveMarks(save_marks))
             }
             Err(err) => {
                 self.status_msg = Some(err.to_string());
@@ -354,14 +571,14 @@ mod tests {
         let action = app.on_key(key);
         assert_eq!(
             action,
-            Some(Action::SaveMarks {
-                job_id: 1,
-                marks: Marks {
+            Some(Action::SaveMarks(vec![(
+                1,
+                Marks {
                     starred: true,
                     hidden: false,
                     applied_at: None,
                 }
-            })
+            )]))
         );
     }
 
@@ -450,5 +667,135 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty());
         let _ = app.on_key(key);
         assert_eq!(app.class_year, 1);
+    }
+
+    fn make_row_with_locs(
+        id: i64,
+        company: &str,
+        title: &str,
+        active: bool,
+        marks: Marks,
+        date_posted: i64,
+        locations: Vec<String>,
+    ) -> Row {
+        let mut r = make_row(id, company, title, active, marks);
+        r.date_posted = date_posted;
+        r.locations = locations;
+        r
+    }
+
+    #[test]
+    fn header_collapsed_by_default() {
+        let r1 = make_row_with_locs(1, "Acme", "SWE", true, Marks::default(), 100, vec!["SF".into()]);
+        let r2 = make_row_with_locs(2, "Acme", "SWE", true, Marks::default(), 200, vec!["NYC".into()]);
+        let cfg = test_config();
+        let app = App::new(vec![r1, r2], &cfg);
+        assert_eq!(app.lines.len(), 1);
+        assert!(matches!(app.lines[0], Line::Header(_)));
+    }
+
+    #[test]
+    fn enter_expands_and_collapses() {
+        let r1 = make_row_with_locs(1, "Acme", "SWE", true, Marks::default(), 100, vec!["SF".into()]);
+        let r2 = make_row_with_locs(2, "Acme", "SWE", true, Marks::default(), 200, vec!["NYC".into()]);
+        let cfg = test_config();
+        let mut app = App::new(vec![r1, r2], &cfg);
+        assert_eq!(app.lines.len(), 1);
+
+        // Enter on header expands
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(app.lines.len(), 3);
+        assert_eq!(app.selected, 0);
+
+        // Select child
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.selected, 1);
+
+        // Enter on child collapses parent and moves selection to header
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(app.lines.len(), 1);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn marks_on_header_blocked() {
+        let r1 = make_row_with_locs(1, "Acme", "SWE", true, Marks::default(), 100, vec!["SF".into()]);
+        let r2 = make_row_with_locs(2, "Acme", "SWE", true, Marks::default(), 200, vec!["NYC".into()]);
+        let cfg = test_config();
+        let mut app = App::new(vec![r1, r2], &cfg);
+        let action = app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()));
+        assert!(action.is_none());
+        assert_eq!(app.status_msg.as_deref(), Some("press Enter to pick a location"));
+    }
+
+    #[test]
+    fn mark_child_saves_all_links() {
+        let r1 = make_row_with_locs(1, "Acme", "SWE", true, Marks::default(), 100, vec!["SF".into()]);
+        let r2 = make_row_with_locs(2, "Acme", "SWE", true, Marks::default(), 200, vec!["SF".into()]);
+        let r3 = make_row_with_locs(3, "Acme", "SWE", true, Marks::default(), 150, vec!["NYC".into()]);
+        let cfg = test_config();
+        let mut app = App::new(vec![r1, r2, r3], &cfg);
+        // Expand group
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        // Move to first child (SF, which has 2 postings: id 2 and 1)
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        let action = app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()));
+        assert_eq!(
+            action,
+            Some(Action::SaveMarks(vec![
+                (
+                    2,
+                    Marks {
+                        starred: true,
+                        hidden: false,
+                        applied_at: None,
+                    }
+                ),
+                (
+                    1,
+                    Marks {
+                        starred: true,
+                        hidden: false,
+                        applied_at: None,
+                    }
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn group_shrinks_to_plain_after_hide() {
+        let r1 = make_row_with_locs(1, "Acme", "SWE", true, Marks::default(), 100, vec!["SF".into()]);
+        let r2 = make_row_with_locs(2, "Acme", "SWE", true, Marks::default(), 200, vec!["NYC".into()]);
+        let cfg = test_config();
+        let mut app = App::new(vec![r1, r2], &cfg);
+        // Expand
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(app.lines.len(), 3);
+        // Select child 1 (index 1)
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        assert_eq!(app.selected, 1);
+        // Hide it
+        let action = app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()));
+        assert!(action.is_some());
+        // Remaining group has 1 location row, so it becomes Plain
+        assert_eq!(app.lines.len(), 1);
+        assert!(matches!(app.lines[0], Line::Plain(_)));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn open_uses_newest_link() {
+        let r1 = make_row_with_locs(1, "Acme", "SWE", true, Marks::default(), 100, vec!["SF".into()]);
+        let r2 = make_row_with_locs(2, "Acme", "SWE", true, Marks::default(), 200, vec!["SF".into()]);
+        let r3 = make_row_with_locs(3, "Acme", "SWE", true, Marks::default(), 150, vec!["NYC".into()]);
+        let cfg = test_config();
+        let mut app = App::new(vec![r1, r2, r3], &cfg);
+        // Expand
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        // Select child (SF, newest is id 2)
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        let action = app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
+        assert_eq!(action, Some(Action::OpenUrl("https://example.com/job/2".into())));
     }
 }

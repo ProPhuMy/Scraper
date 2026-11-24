@@ -45,9 +45,11 @@ fn run_loop(
 
             if let Some(action) = app.on_key(key) {
                 match action {
-                    Action::SaveMarks { job_id, marks } => {
-                        if let Err(e) = db::set_marks(conn, job_id, marks) {
-                            app.status_msg = Some(format!("failed to save marks: {e}"));
+                    Action::SaveMarks(pairs) => {
+                        for (job_id, marks) in pairs {
+                            if let Err(e) = db::set_marks(conn, job_id, marks) {
+                                app.status_msg = Some(format!("failed to save marks: {e}"));
+                            }
                         }
                     }
                     Action::OpenUrl(url) => {
