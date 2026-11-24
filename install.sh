@@ -75,6 +75,9 @@ if [ "${SCRAPER_DRY_RUN:-0}" = "1" ]; then
   exit 0
 fi
 
+say() { echo "scraper-install: $*"; }
+say "detected $OS $ARCH"
+
 # Detect downloader
 if command -v curl >/dev/null 2>&1; then
   DOWNLOADER="curl"
@@ -108,14 +111,20 @@ download_file() {
 }
 
 # Download asset and checksum
+say "downloading $ASSET (${SCRAPER_VERSION:-latest})..."
 download_file "$URL" "$TMP_DIR/$ASSET" "asset '$ASSET'"
 download_file "$CHECKSUM_URL" "$TMP_DIR/${ASSET}.sha256" "checksum for asset '$ASSET'"
 
 # Verify checksum
 verify_status=0
+checked=0
 if command -v sha256sum >/dev/null 2>&1; then
+  say "verifying checksum..."
+  checked=1
   (cd "$TMP_DIR" && sha256sum -c "${ASSET}.sha256" >/dev/null 2>&1) || verify_status=$?
 elif command -v shasum >/dev/null 2>&1; then
+  say "verifying checksum..."
+  checked=1
   (cd "$TMP_DIR" && shasum -a 256 -c "${ASSET}.sha256" >/dev/null 2>&1) || verify_status=$?
 else
   echo "scraper-install: WARNING: no sha256sum or shasum found; skipping checksum verification" >&2
@@ -125,6 +134,7 @@ if [ "$verify_status" -ne 0 ]; then
   echo "scraper-install: checksum verification failed for $ASSET" >&2
   exit 1
 fi
+if [ "$checked" = "1" ]; then say "checksum ok"; fi
 
 # Install binary
 mkdir -p "$INSTALL_DIR"
@@ -152,7 +162,7 @@ if ! "$INSTALL_DIR/$BIN_NAME" --help >/dev/null 2>&1; then
   echo "scraper-install: WARNING: '$INSTALL_DIR/$BIN_NAME --help' failed. The binary may not run on this system." >&2
 fi
 
-echo "scraper installed successfully to $INSTALL_DIR/$BIN_NAME"
+say "installed to $INSTALL_DIR/$BIN_NAME"
 echo ""
 echo "Next steps:"
 echo "  1. Download the config template to ./scraper.toml:"
