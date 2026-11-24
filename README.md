@@ -22,7 +22,7 @@ irm https://raw.githubusercontent.com/ProPhuMy/Scraper/main/install.ps1 | iex
 curl -fsSL https://raw.githubusercontent.com/ProPhuMy/Scraper/main/install.sh | sh
 ```
 
-Both scripts download the right prebuilt binary for your system (no Rust or source code needed). They verify its SHA-256 checksum and install it to `~/.local/bin` (`%USERPROFILE%\.localin` on Windows). The PowerShell installer also adds that folder to your user PATH, so open a new terminal afterwards. Optional environment variables:
+Both scripts download the right prebuilt binary for your system (no Rust or source code needed). They verify its SHA-256 checksum and install it to `~/.local/bin` (`%USERPROFILE%\.local\bin` on Windows). The PowerShell installer also adds that folder to your user PATH, so open a new terminal afterwards. Optional environment variables:
 
 | Variable | Default | Effect |
 |---|---|---|
