@@ -25,11 +25,27 @@ The script picks the right build for your system, checks its SHA-256 checksum, a
 
 ## Set up
 
-Download the config template and fill in your profile:
+Create your config folder, then fill in your profile:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ProPhuMy/Scraper/main/scraper.example.toml -o scraper.toml
+scraper init
 ```
+
+This creates `scraper.toml` and a starter `.env` (for the optional LLM key) in:
+
+| OS | Folder |
+|---|---|
+| Windows | `%APPDATA%\scraper\` |
+| Linux / macOS | `$XDG_CONFIG_HOME/scraper/` (default `~/.config/scraper/`) |
+
+It never overwrites files that already exist. The job database (`scraper.db`) lives in the same folder, so `scraper` works from any directory.
+
+Where `scraper` looks for its config:
+1. The path passed with `--config`.
+2. Otherwise, a `scraper.toml` in the current folder, if there is one.
+3. Otherwise, the folder above.
+
+`--db` overrides the database location. Edit the `[profile]` section:
 
 ```toml
 season_year = 2027            # which Simplify list to use (Summer 2027)
@@ -103,7 +119,7 @@ The rules lean toward **maybe** when unsure, because wrongly hiding a job you co
 
 ### Optional: LLM pass for unclear wording
 
-Facts the rules can't settle can be sent to any OpenAI-compatible chat API (Gemini, Groq, OpenRouter, ...). Add this to `scraper.toml`:
+Facts the rules can't settle can be sent to any OpenAI-compatible chat API (Gemini, Groq, OpenRouter, ...). Uncomment `LLM_API_KEY` in the `.env` that `scraper init` created, paste your key, and add this to `scraper.toml`:
 
 ```toml
 [llm]
