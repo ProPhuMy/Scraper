@@ -317,6 +317,16 @@ pub struct JsonOutput<'a> {
     pub new: bool,
 }
 
+/// Writes to stdout, treating a closed pipe (`scraper list | head`) as success instead of panicking.
+fn write_stdout(s: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out.write_all(s.as_bytes()).and_then(|_| out.flush()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
+    }
+}
+
 pub fn list(
     cfg: &Config,
     db_path: &Path,
@@ -417,13 +427,15 @@ pub fn list(
             })
             .collect();
 
-        println!("{}", serde_json::to_string_pretty(&json_items)?);
+        write_stdout(&format!("{}
+", serde_json::to_string_pretty(&json_items)?))?;
     } else {
         let color = std::io::stdout().is_terminal()
             && std::env::var_os("NO_COLOR").map_or(true, |v| v.is_empty());
         let table = render_table(&view_rows, color);
-        println!("{table}");
-        println!("{a_count} apply, {m_count} maybe, {n_count} no");
+        write_stdout(&format!("{table}
+{a_count} apply, {m_count} maybe, {n_count} no
+"))?;
     }
 
     Ok(())
