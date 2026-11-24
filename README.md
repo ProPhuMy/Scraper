@@ -49,13 +49,47 @@ Changing the profile takes effect immediately. Verdicts are computed when you ru
 ```sh
 scraper sync                       # download and filter the job list
 scraper scan                       # read each job's form + description (resumable)
-scraper list                       # show apply + maybe
+scraper browse                     # interactive browser (below)
+scraper list                       # show apply + maybe as a table
 scraper list --verdict no          # show only rejections, with reasons
 scraper list --year 2              # "what if I were a sophomore?"
+scraper list --starred             # also --applied, --new
 scraper list --all --json          # everything, machine-readable
 ```
 
-`scan` saves after every job, so you can stop it and run it again later. It only fetches what's left. Re-run `sync` from time to time to pick up new postings.
+`scan` saves after every job, so you can stop it and run it again later. It only fetches what's left. Re-run `sync` from time to time to pick up new postings, or press `r` inside `browse`.
+
+### `scraper browse`
+
+A terminal UI with tabs for **Jobs**, **Starred**, **Applied** and **Hidden**, plus a detail panel that quotes the sentence behind every verdict.
+
+| Key | Action |
+|---|---|
+| `↑` `↓` / `j` `k`, `PgUp` `PgDn`, `g` `G` | move |
+| `Tab` / `Shift+Tab` | switch tab |
+| `/` | search company, title or location |
+| `1` `2` `3` `0` | show apply / maybe / no / all (Jobs tab) |
+| `y` | try another class year |
+| `Enter` / `→` `←` | expand or collapse a `×N` group |
+| `s` / `h` / `a` | star, hide, mark applied (press again to undo) |
+| `o` | open the job page in your browser |
+| `A` | open the job page **and** mark it applied |
+| `r` | refresh: sync + scan in the background with live progress |
+| `?` / `q` | help / quit |
+
+- **Grouping:** the same job posted in several cities shows as one `×N` row. Expand it to pick a location. Duplicate links for one location merge into a single row, e.g. `Salt Lake City, UT (2 links)`.
+- **Marks:** your marks are saved immediately and survive re-syncs. Applied and starred jobs stay in their tabs even after the posting closes.
+- **Badges** in the MARK column: `★` starred, `✓` applied, `N` new since the last sync, `✗` closed (Simplify dropped it, or the page is gone).
+
+### Re-checking old postings
+
+Each `scan` (and `r`) also re-fetches up to 200 jobs that haven't been checked in 7 days, starred and applied first. It catches postings that closed and requirements that changed. A temporarily unreachable page never overwrites results you already have. Tune it in `scraper.toml`:
+
+```toml
+[scan]
+recheck_days = 7     # 0 turns re-checking off
+recheck_max = 200
+```
 
 ## How verdicts work
 
