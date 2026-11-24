@@ -25,10 +25,16 @@ impl std::fmt::Debug for LlmClient {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RateLimit {
+    PerMinute,
+    Daily(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LlmOutcome {
     Facts(Facts),
-    QuotaExhausted,
+    QuotaExhausted(String),
 }
 
 impl LlmClient {
@@ -96,14 +102,16 @@ impl LlmClient {
                     }
 
                     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        if is_quota_error(status.as_u16(), &text) {
-                            return Ok(LlmOutcome::QuotaExhausted);
-                        }
-                        if attempt == 1 {
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            continue;
-                        } else {
-                            anyhow::bail!("HTTP 429 after retry: {text}");
+                        match classify_429(&text) {
+                            RateLimit::Daily(d) => return Ok(LlmOutcome::QuotaExhausted(d)),
+                            RateLimit::PerMinute => {
+                                if attempt <= 2 {
+                                    tokio::time::sleep(Duration::from_secs(60)).await;
+                                    continue;
+                                } else {
+                                    anyhow::bail!("HTTP 429 after retry: {text}");
+                                }
+                            }
                         }
                     }
 
@@ -160,6 +168,108 @@ Allowed values:
 - citizenship: \"required\" if US citizenship, US person status, or a security clearance is required or asked for. Else \"not_mentioned\" or \"unknown\". Ignore equal-opportunity boilerplate and \"authorized to work in the US\" questions.
 - experience: \"required\" if prior internship/work experience is required, \"preferred\" if it is a plus. Skills like \"experience with Python\" do not count. Else \"not_mentioned\" or \"unknown\".";
 
+static OPT_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\bopt\b").expect("valid regex"));
+
+pub fn focus_excerpt(description: &str, unknown: &[&str]) -> String {
+    let sents = crate::text::sentences(description);
+    if sents.is_empty() {
+        return truncate_chars(description, 4_000);
+    }
+
+    let check_sponsorship = unknown.contains(&"sponsorship");
+    let check_citizenship = unknown.contains(&"citizenship");
+    let check_gpa = unknown.contains(&"gpa");
+    let check_experience = unknown.contains(&"experience");
+    let check_class_years = unknown.contains(&"class_years");
+
+    let mut keep = vec![false; sents.len()];
+    let mut any_matched = false;
+
+    for (i, sent) in sents.iter().enumerate() {
+        let norm = crate::text::normalize(sent);
+        let mut matched = false;
+
+        if check_sponsorship
+            && (norm.contains("sponsor")
+                || norm.contains("visa")
+                || norm.contains("h-1b")
+                || norm.contains("h1b")
+                || norm.contains("cpt")
+                || OPT_RE.is_match(&norm)
+                || norm.contains("f-1")
+                || norm.contains("immigration")
+                || norm.contains("work authorization")
+                || norm.contains("authorized to work"))
+        {
+            matched = true;
+        }
+
+        if !matched
+            && check_citizenship
+            && (norm.contains("citizen")
+                || norm.contains("clearance")
+                || norm.contains("us person")
+                || norm.contains("itar")
+                || norm.contains("export")
+                || norm.contains("permanent resident")
+                || norm.contains("green card"))
+        {
+            matched = true;
+        }
+
+        if !matched && check_gpa && (norm.contains("gpa") || norm.contains("grade point")) {
+            matched = true;
+        }
+
+        if !matched
+            && check_experience
+            && (norm.contains("experience") || norm.contains("internship"))
+        {
+            matched = true;
+        }
+
+        if !matched
+            && check_class_years
+            && (norm.contains("freshm")
+                || norm.contains("sophomore")
+                || norm.contains("junior")
+                || norm.contains("senior")
+                || norm.contains("graduat")
+                || norm.contains("class of")
+                || norm.contains("enrolled")
+                || norm.contains("undergraduate")
+                || norm.contains("student")
+                || norm.contains("degree"))
+        {
+            matched = true;
+        }
+
+        if matched {
+            any_matched = true;
+            if i > 0 {
+                keep[i - 1] = true;
+            }
+            keep[i] = true;
+            if i + 1 < sents.len() {
+                keep[i + 1] = true;
+            }
+        }
+    }
+
+    if !any_matched {
+        return truncate_chars(description, 4_000);
+    }
+
+    let kept_sents: Vec<&str> = sents
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| if keep[i] { Some(s.as_str()) } else { None })
+        .collect();
+
+    truncate_chars(&kept_sents.join("\n"), 4_000)
+}
+
 pub fn build_messages(
     title: &str,
     page: &PortalPage,
@@ -185,9 +295,10 @@ pub fn build_messages(
             user.push_str(&format!("- {} [options: {}]\n", q.label, q.options.join(" | ")));
         }
     }
+    let excerpt = focus_excerpt(&page.description, &facts.unknown_names());
     user.push_str(&format!(
-        "Description:\n{}",
-        truncate_chars(&page.description, 12_000)
+        "Relevant excerpts from the description:\n{}",
+        excerpt
     ));
 
     (sys, user)
@@ -758,12 +869,115 @@ pub fn fact_changes(before: &Facts, after: &Facts) -> Vec<(String, String)> {
     changes
 }
 
-pub fn is_quota_error(status: u16, body: &str) -> bool {
-    if status != 429 {
-        return false;
-    }
+pub fn classify_429(body: &str) -> RateLimit {
     let lower = body.to_lowercase();
-    lower.contains("quota") || lower.contains("resource_exhausted") || lower.contains("per day")
+
+    if lower.contains("per minute")
+        || lower.contains("perminute")
+        || lower.contains("(tpm)")
+        || lower.contains("(rpm)")
+        || lower.contains("tokens per minute")
+        || lower.contains("requests per minute")
+    {
+        return RateLimit::PerMinute;
+    }
+
+    if !(lower.contains("per day")
+        || lower.contains("perday")
+        || lower.contains("(tpd)")
+        || lower.contains("(rpd)")
+        || lower.contains("quota")
+        || lower.contains("resource_exhausted"))
+    {
+        return RateLimit::PerMinute;
+    }
+
+    let detail = extract_daily_detail(body);
+    RateLimit::Daily(detail)
+}
+
+fn extract_daily_detail(body: &str) -> String {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(body) else {
+        return String::new();
+    };
+
+    if let Some(msg) = val.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+        // anchor on " on tokens"/" on requests": a bare "on " also matches inside "organization `org_x`"
+        let start = msg
+            .find(" on tokens")
+            .or_else(|| msg.find(" on requests"))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let slice = &msg[start..];
+        if let Some(please_idx) = slice.find("Please try again in ") {
+            let after = please_idx + "Please try again in ".len();
+            if let Some(dot_idx) = slice[after..].find('.') {
+                let end = after + dot_idx;
+                return slice[..end].trim().to_string();
+            } else {
+                return slice.trim().to_string();
+            }
+        } else if let Some(dot_idx) = slice.find('.') {
+            return slice[..dot_idx].trim().to_string();
+        } else {
+            return slice.trim().to_string();
+        }
+    }
+
+    if let Some(details) = val.get("error").and_then(|e| e.get("details")).and_then(|d| d.as_array()) {
+        let mut quota_id: Option<&str> = None;
+        let mut quota_value: Option<&str> = None;
+        let mut retry_delay: Option<&str> = None;
+
+        for item in details {
+            if let Some(violations) = item.get("violations").and_then(|v| v.as_array()) {
+                for v in violations {
+                    if let Some(qid) = v.get("quotaId").and_then(|q| q.as_str()) {
+                        quota_id = Some(qid);
+                    }
+                    if let Some(qval) = v.get("quotaValue").and_then(|q| q.as_str()) {
+                        quota_value = Some(qval);
+                    }
+                }
+            }
+            if let Some(delay) = item.get("retryDelay").and_then(|d| d.as_str()) {
+                retry_delay = Some(delay);
+            }
+        }
+
+        if quota_id.is_some() || quota_value.is_some() {
+            let mut parts = String::new();
+            if let Some(qid) = quota_id {
+                parts.push_str(qid);
+            }
+            if let Some(qval) = quota_value {
+                if !parts.is_empty() {
+                    parts.push_str(&format!(", limit {qval}"));
+                } else {
+                    parts.push_str(&format!("limit {qval}"));
+                }
+            }
+
+            if let Some(delay_str) = retry_delay {
+                if let Some(sec_str) = delay_str.strip_suffix('s') {
+                    if let Ok(sec) = sec_str.parse::<f64>() {
+                        let resets = if sec >= 3600.0 {
+                            let hours = (sec / 3600.0).round() as u64;
+                            format!("~{hours}h")
+                        } else {
+                            let mins = (sec / 60.0).round() as u64;
+                            format!("~{mins}m")
+                        };
+                        parts.push_str(&format!("; resets in {resets}"));
+                    }
+                }
+            }
+
+            return parts;
+        }
+    }
+
+    String::new()
 }
 
 #[cfg(test)]
@@ -812,15 +1026,117 @@ mod tests {
     }
 
     #[test]
-    fn quota_detection() {
-        assert!(is_quota_error(
-            429,
-            r#"{"error":{"status":"RESOURCE_EXHAUSTED"}}"#
-        ));
-        assert!(is_quota_error(429, "You have exceeded your quota."));
-        assert!(is_quota_error(429, "Limit 100 requests per day exceeded"));
-        assert!(!is_quota_error(429, "slow down"));
-        assert!(!is_quota_error(500, "quota"));
+    fn test_classify_429_groq_and_gemini() {
+        let groq_tpd = r#"{"error":{"message":"Rate limit reached for model `openai/gpt-oss-120b` in organization `org_x` service tier `on_demand` on tokens per day (TPD): Limit 200000, Used 199586, Requested 1033. Please try again in 6h12m. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing","type":"tokens","code":"rate_limit_exceeded"}}"#;
+        match classify_429(groq_tpd) {
+            RateLimit::Daily(detail) => {
+                assert!(detail.contains("Limit 200000"), "expected Limit 200000, got: {detail}");
+                assert!(detail.contains("6h12m"), "expected 6h12m, got: {detail}");
+                assert!(detail.starts_with("on tokens per day"), "detail must not start inside 'organization': {detail}");
+            }
+            RateLimit::PerMinute => panic!("expected Daily for Groq TPD"),
+        }
+
+        let groq_tpm = r#"{"error":{"message":"Rate limit reached for model `openai/gpt-oss-120b` in organization `org_x` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7900, Requested 1033. Please try again in 7.5s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing","type":"tokens","code":"rate_limit_exceeded"}}"#;
+        assert_eq!(classify_429(groq_tpm), RateLimit::PerMinute);
+
+        let gemini_daily = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier","quotaValue":"20"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"40313s"}]}}"#;
+        match classify_429(gemini_daily) {
+            RateLimit::Daily(detail) => {
+                assert!(detail.contains("limit 20"), "expected limit 20, got: {detail}");
+                assert!(detail.contains("~11h"), "expected ~11h, got: {detail}");
+            }
+            RateLimit::PerMinute => panic!("expected Daily for Gemini daily"),
+        }
+
+        let gemini_pm = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"generativelanguage.googleapis.com/generate_content_free_tier_requests","quotaId":"GenerateRequestsPerMinutePerProjectPerModel-FreeTier","quotaValue":"20"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"21s"}]}}"#;
+        assert_eq!(classify_429(gemini_pm), RateLimit::PerMinute);
+
+        assert_eq!(classify_429("slow down"), RateLimit::PerMinute);
+    }
+
+    #[test]
+    fn test_classify_429_edge_cases() {
+        let gemini_no_s = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"x","quotaId":"qid","quotaValue":"10"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"4000"}]}}"#;
+        match classify_429(gemini_no_s) {
+            RateLimit::Daily(detail) => {
+                assert_eq!(detail, "qid, limit 10");
+            }
+            _ => panic!("expected Daily"),
+        }
+
+        let gemini_non_num = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"x","quotaId":"qid","quotaValue":"10"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"foobars"}]}}"#;
+        match classify_429(gemini_non_num) {
+            RateLimit::Daily(detail) => {
+                assert_eq!(detail, "qid, limit 10");
+            }
+            _ => panic!("expected Daily"),
+        }
+
+        let gemini_mins = r#"{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"quotaMetric":"x","quotaId":"qid","quotaValue":"10"}]},{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"300s"}]}}"#;
+        match classify_429(gemini_mins) {
+            RateLimit::Daily(detail) => {
+                assert!(detail.contains("~5m"));
+            }
+            _ => panic!("expected Daily"),
+        }
+
+        let raw_daily = "Daily quota exceeded";
+        match classify_429(raw_daily) {
+            RateLimit::Daily(detail) => {
+                assert_eq!(detail, "");
+            }
+            _ => panic!("expected Daily"),
+        }
+    }
+
+    #[test]
+    fn test_focus_excerpt_sponsorship_and_neighbors() {
+        let desc = "Sentence 0 about company.\nSentence 1 about culture.\nSentence 2 about team.\nSentence 3 mentioning visa sponsorship is not offered.\nSentence 4 about benefits.\nSentence 5 about office location.\nSentence 6 about food.";
+        let res = focus_excerpt(desc, &["sponsorship"]);
+        assert_eq!(
+            res,
+            "Sentence 2 about team\nSentence 3 mentioning visa sponsorship is not offered\nSentence 4 about benefits"
+        );
+    }
+
+    #[test]
+    fn test_focus_excerpt_opt_word_match() {
+        let desc = "We have an option for remote work.\nAnother unrelated sentence.\nYet another sentence.";
+        let res = focus_excerpt(desc, &["sponsorship"]);
+        assert_eq!(res, desc);
+
+        let desc2 = "CPT/OPT students are welcome to apply.\nWe offer great mentorship.\nApply today.";
+        let res2 = focus_excerpt(desc2, &["sponsorship"]);
+        assert!(res2.contains("CPT/OPT students are welcome to apply"));
+    }
+
+    #[test]
+    fn test_focus_excerpt_no_match_returns_first_4000_chars() {
+        let long_desc = "Hello world. ".repeat(400);
+        let res = focus_excerpt(&long_desc, &["sponsorship"]);
+        assert_eq!(res.chars().count(), 4_000);
+        assert_eq!(res, truncate_chars(&long_desc, 4_000));
+    }
+
+    #[test]
+    fn test_focus_excerpt_capped_at_4000_chars() {
+        let sentence = "We do not offer visa sponsorship. ";
+        let desc = sentence.repeat(200);
+        let res = focus_excerpt(&desc, &["sponsorship"]);
+        assert_eq!(res.chars().count(), 4_000);
+    }
+
+    #[test]
+    fn test_focus_excerpt_only_uses_active_unknowns() {
+        let desc = "Minimum 3.5 GPA required.\nWe love learning.\nUS citizenship required.";
+        let res = focus_excerpt(desc, &["gpa"]);
+        assert_eq!(res, "Minimum 3.5 GPA required\nWe love learning");
+        assert!(!res.contains("citizenship"));
+
+        let res2 = focus_excerpt(desc, &["citizenship"]);
+        assert_eq!(res2, "We love learning\nUS citizenship required.");
+        assert!(!res2.contains("GPA"));
     }
 
     #[test]
@@ -948,6 +1264,7 @@ mod tests {
             model: "model".into(),
             api_key_env: "DEFINITELY_NON_EXISTENT_VAR_XYZ_12345".into(),
             requests_per_minute: 10,
+            max_age_days: 30,
         };
         let err = LlmClient::from_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("DEFINITELY_NON_EXISTENT_VAR_XYZ_12345"));

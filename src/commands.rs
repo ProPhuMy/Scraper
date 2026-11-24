@@ -60,7 +60,10 @@ pub enum Progress {
         job_id: i64,
         error: String,
     },
-    LlmQuota,
+    LlmQuota {
+        detail: String,
+        settled: usize,
+    },
     LlmError {
         job_id: i64,
         error: String,
@@ -171,8 +174,18 @@ pub fn format_progress(p: &Progress) -> Option<(bool, String)> {
             true,
             format!("failed to save LLM facts for job {job_id}: {error}"),
         )),
-        Progress::LlmQuota => {
-            Some((false, "LLM quota reached; run scan again later".to_string()))
+        Progress::LlmQuota { detail, settled } => {
+            if detail.is_empty() {
+                Some((
+                    false,
+                    format!("LLM daily limit reached. Settled {settled} job(s) this run; run scan again later"),
+                ))
+            } else {
+                Some((
+                    false,
+                    format!("LLM daily limit reached ({detail}). Settled {settled} job(s) this run; run scan again later"),
+                ))
+            }
         }
         Progress::LlmError { job_id, error } => {
             Some((true, format!("LLM error for job {job_id}: {error}")))
@@ -450,7 +463,7 @@ pub async fn scan_with(
 
     let candidates = {
         let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
-        db::llm_candidates(&conn, limit)?
+        db::llm_candidates(&conn, limit, llm_cfg.max_age_days, db::now_unix())?
     };
 
     let total = candidates.len();
@@ -480,8 +493,8 @@ pub async fn scan_with(
                     changes,
                 });
             }
-            Ok(LlmOutcome::QuotaExhausted) => {
-                report(Progress::LlmQuota);
+            Ok(LlmOutcome::QuotaExhausted(detail)) => {
+                report(Progress::LlmQuota { detail, settled: done });
                 break;
             }
             Err(e) => {
@@ -675,8 +688,11 @@ mod tests {
             ))
         );
         assert_eq!(
-            format_progress(&Progress::LlmQuota),
-            Some((false, "LLM quota reached; run scan again later".into()))
+            format_progress(&Progress::LlmQuota {
+                detail: "".into(),
+                settled: 0,
+            }),
+            Some((false, "LLM daily limit reached. Settled 0 job(s) this run; run scan again later".into()))
         );
         assert_eq!(
             format_progress(&Progress::LlmError {
@@ -760,6 +776,33 @@ mod tests {
         assert_eq!(
             decide_recheck(Some(&old_page), &fetched),
             RecheckAction::MarkGone
+        );
+    }
+
+    #[test]
+    fn test_format_progress_llm_quota() {
+        let p_with_detail = Progress::LlmQuota {
+            detail: "on tokens per day (TPD): Limit 200000. Please try again in 6h12m".into(),
+            settled: 3,
+        };
+        assert_eq!(
+            format_progress(&p_with_detail),
+            Some((
+                false,
+                "LLM daily limit reached (on tokens per day (TPD): Limit 200000. Please try again in 6h12m). Settled 3 job(s) this run; run scan again later".into()
+            ))
+        );
+
+        let p_empty = Progress::LlmQuota {
+            detail: "".into(),
+            settled: 0,
+        };
+        assert_eq!(
+            format_progress(&p_empty),
+            Some((
+                false,
+                "LLM daily limit reached. Settled 0 job(s) this run; run scan again later".into()
+            ))
         );
     }
 }

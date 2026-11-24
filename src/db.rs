@@ -315,11 +315,18 @@ pub fn mark(conn: &Connection, job_id: i64, status: Status, error: Option<&str>)
     Ok(())
 }
 
-pub fn llm_candidates(conn: &Connection, limit: Option<usize>) -> anyhow::Result<Vec<(Job, PortalPage, Facts)>> {
+pub fn llm_candidates(
+    conn: &Connection,
+    limit: Option<usize>,
+    max_age_days: u32,
+    now: i64,
+) -> anyhow::Result<Vec<(Job, PortalPage, Facts)>> {
+    let cutoff = now.saturating_sub((max_age_days as i64) * 86400);
     let mut stmt = conn.prepare(
         "SELECT id, simplify_id, company, title, url, provider, page, facts FROM jobs
-         WHERE active = 1 AND status = 'rules_done'
-         ORDER BY date_posted DESC"
+         WHERE active = 1 AND status = 'rules_done' AND applied_at IS NULL AND hidden = 0
+           AND (starred = 1 OR ?1 = 0 OR date_posted >= ?2)
+         ORDER BY starred DESC, date_posted DESC, id DESC"
     )?;
 
     struct RawRow {
@@ -328,7 +335,7 @@ pub fn llm_candidates(conn: &Connection, limit: Option<usize>) -> anyhow::Result
         facts_str: Option<String>,
     }
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![max_age_days, cutoff], |row| {
         let id: i64 = row.get(0)?;
         let simplify_id: String = row.get(1)?;
         let company: String = row.get(2)?;
@@ -801,7 +808,7 @@ mod tests {
         assert!(!known_facts.has_unknown());
         save_page(&c, 2, &page, &known_facts).unwrap();
 
-        let candidates = llm_candidates(&c, None).unwrap();
+        let candidates = llm_candidates(&c, None, 0, 1000).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0.simplify_id, "a");
     }
@@ -1273,6 +1280,76 @@ mod tests {
         assert_eq!(page_after, original_page);
         assert_eq!(facts_after, original_facts);
         assert_eq!(attempts_after, original_attempts);
+    }
+
+    #[test]
+    fn test_llm_candidates_behavior() {
+        let mut conn = open_in_memory().unwrap();
+        let now = 1_000_000i64;
+        let day = 86400i64;
+
+        let mut j1 = nj("j_starred_old", 100);
+        j1.date_posted = now - 40 * day;
+
+        let mut j2 = nj("j_newest", 100);
+        j2.date_posted = now - 5 * day;
+
+        let mut j3 = nj("j_middle", 100);
+        j3.date_posted = now - 10 * day;
+
+        let mut j4 = nj("j_old_unstarred", 100);
+        j4.date_posted = now - 40 * day;
+
+        let mut j5 = nj("j_applied", 100);
+        j5.date_posted = now - 2 * day;
+
+        let mut j6 = nj("j_hidden", 100);
+        j6.date_posted = now - 2 * day;
+
+        let mut j7 = nj("j_known", 100);
+        j7.date_posted = now - 1 * day;
+
+        upsert_jobs(&mut conn, &[
+            j1.clone(), j2.clone(), j3.clone(), j4.clone(), j5.clone(), j6.clone(), j7.clone(),
+        ]).unwrap();
+
+        let page = PortalPage {
+            description: "A description".to_string(),
+            questions: vec![],
+        };
+        let unknown_facts = Facts::unknown();
+        let mut known_facts = Facts::unknown();
+        known_facts.class_years.value = ClassYears::Any;
+        known_facts.gpa.value = Gpa::NotMentioned;
+        known_facts.sponsorship.value = Sponsorship::NotMentioned;
+        known_facts.citizenship.value = Citizenship::NotMentioned;
+        known_facts.experience.value = Experience::NotMentioned;
+        assert!(!known_facts.has_unknown());
+
+        for row in list_jobs(&conn).unwrap() {
+            let f = if row.job.simplify_id == "j_known" {
+                &known_facts
+            } else {
+                &unknown_facts
+            };
+            save_page(&conn, row.job.id, &page, f).unwrap();
+        }
+
+        conn.execute("UPDATE jobs SET starred = 1 WHERE simplify_id = 'j_starred_old'", []).unwrap();
+        conn.execute("UPDATE jobs SET applied_at = ?1 WHERE simplify_id = 'j_applied'", params![now]).unwrap();
+        conn.execute("UPDATE jobs SET hidden = 1 WHERE simplify_id = 'j_hidden'", []).unwrap();
+
+        let candidates = llm_candidates(&conn, None, 30, now).unwrap();
+        let ids: Vec<_> = candidates.iter().map(|c| c.0.simplify_id.as_str()).collect();
+        assert_eq!(ids, vec!["j_starred_old", "j_newest", "j_middle"]);
+
+        let candidates_no_cutoff = llm_candidates(&conn, None, 0, now).unwrap();
+        let ids_no_cutoff: Vec<_> = candidates_no_cutoff.iter().map(|c| c.0.simplify_id.as_str()).collect();
+        assert_eq!(ids_no_cutoff, vec!["j_starred_old", "j_newest", "j_middle", "j_old_unstarred"]);
+
+        let candidates_limit = llm_candidates(&conn, Some(2), 30, now).unwrap();
+        let ids_limit: Vec<_> = candidates_limit.iter().map(|c| c.0.simplify_id.as_str()).collect();
+        assert_eq!(ids_limit, vec!["j_starred_old", "j_newest"]);
     }
 
     #[test]

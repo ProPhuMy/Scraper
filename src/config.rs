@@ -49,6 +49,10 @@ impl Profile {
     }
 }
 
+fn default_max_age_days() -> u32 {
+    30
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct LlmConfig {
     pub base_url: String,
@@ -57,6 +61,8 @@ pub struct LlmConfig {
     pub api_key_env: String,
     #[serde(default = "default_requests_per_minute")]
     pub requests_per_minute: u32,
+    #[serde(default = "default_max_age_days")]
+    pub max_age_days: u32,
 }
 
 fn default_recheck_days() -> u32 {
@@ -299,6 +305,7 @@ mod tests {
         let llm = c.llm.expect("expected llm to be Some");
         assert_eq!(llm.api_key_env, "LLM_API_KEY");
         assert_eq!(llm.requests_per_minute, 10);
+        assert_eq!(llm.max_age_days, 30);
     }
 
     #[test]

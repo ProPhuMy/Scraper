@@ -11,6 +11,7 @@ has_prior_internship = false
 # model = "gemini-2.5-flash"
 # api_key_env = "LLM_API_KEY"
 # requests_per_minute = 10
+# max_age_days = 30
 
 # [scan]
 # concurrency = 8

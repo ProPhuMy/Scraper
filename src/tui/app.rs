@@ -642,7 +642,7 @@ impl App {
             Progress::LlmSettled { done, total, .. } => {
                 self.progress = Some(format!("LLM {done}/{total}"));
             }
-            Progress::LlmQuota => {
+            Progress::LlmQuota { .. } => {
                 self.refresh_llm_note = Some("(LLM: quota reached)");
             }
             Progress::LlmClientError(_) => {
@@ -1236,7 +1236,10 @@ mod tests {
         let cfg = test_config();
         let mut app = App::new(vec![r1.clone()], &cfg);
         app.refreshing = true;
-        app.on_progress(&crate::commands::Progress::LlmQuota);
+        app.on_progress(&crate::commands::Progress::LlmQuota {
+            detail: "".into(),
+            settled: 0,
+        });
         app.on_refresh_finished(Ok(()), vec![r1]);
         assert!(
             app.progress
