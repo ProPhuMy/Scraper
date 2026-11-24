@@ -1,3 +1,4 @@
+mod commands;
 mod config;
 mod db;
 mod extract;
@@ -49,8 +50,14 @@ pub enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Sync => anyhow::bail!("not implemented yet"),
-        Commands::Scan { .. } => anyhow::bail!("not implemented yet"),
+        Commands::Sync => {
+            let cfg = config::load(&cli.config)?;
+            commands::sync(&cfg, &cli.db).await
+        }
+        Commands::Scan { limit, no_llm } => {
+            let cfg = config::load(&cli.config)?;
+            commands::scan(&cfg, &cli.db, limit, no_llm).await
+        }
         Commands::List {
             year,
             verdict,
