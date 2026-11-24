@@ -552,6 +552,37 @@ pub fn focus_excerpt(description: &str, unknown: &[&str]) -> String {
     truncate_chars(&kept_sents.join("\n"), 4_000)
 }
 
+/// Max options shown per form question. Real forms carry university / country / state
+/// dropdowns with thousands of entries (Palantir: 3,302 universities), which pushed single
+/// requests to 17-24K tokens and got HTTP 413 from Groq's 8K tokens-per-minute free tier.
+const MAX_OPTIONS_PER_QUESTION: usize = 15;
+/// Hard cap for the whole form-questions section.
+const MAX_QUESTIONS_CHARS: usize = 3_000;
+
+pub fn format_questions(questions: &[crate::model::FormQuestion]) -> String {
+    let mut out = String::new();
+    for q in questions {
+        let line = if q.options.is_empty() {
+            format!("- {}\n", q.label)
+        } else if q.options.len() > MAX_OPTIONS_PER_QUESTION {
+            format!(
+                "- {} [options: {} | …(+{} more)]\n",
+                q.label,
+                q.options[..MAX_OPTIONS_PER_QUESTION].join(" | "),
+                q.options.len() - MAX_OPTIONS_PER_QUESTION
+            )
+        } else {
+            format!("- {} [options: {}]\n", q.label, q.options.join(" | "))
+        };
+        if out.chars().count() + line.chars().count() > MAX_QUESTIONS_CHARS {
+            out.push_str("- …(more questions omitted)\n");
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
 pub fn build_messages(
     title: &str,
     page: &PortalPage,
@@ -570,13 +601,7 @@ pub fn build_messages(
         facts.unknown_names().join(", "),
         title
     );
-    for q in &page.questions {
-        if q.options.is_empty() {
-            user.push_str(&format!("- {}\n", q.label));
-        } else {
-            user.push_str(&format!("- {} [options: {}]\n", q.label, q.options.join(" | ")));
-        }
-    }
+    user.push_str(&format_questions(&page.questions));
     let excerpt = focus_excerpt(&page.description, &facts.unknown_names());
     user.push_str(&format!(
         "Relevant excerpts from the description:\n{}",
@@ -1718,6 +1743,27 @@ mod tests {
         assert!(!blocking_evidence_ok("class_years", "[2028]", undergrad_ev));
         assert!(blocking_evidence_ok("class_years", "[2028]", "Class of 2028 only"));
         assert!(blocking_evidence_ok("class_years", "any", undergrad_ev));
+    }
+
+    #[test]
+    fn huge_dropdowns_are_capped() {
+        // real shape: Palantir's university dropdown had 3,302 options (request hit 22K tokens, HTTP 413)
+        let unis: Vec<String> = (0..3302).map(|i| format!("University number {i}")).collect();
+        let qs = vec![
+            FormQuestion { label: "Which university are you currently attending?".into(), options: unis },
+            FormQuestion { label: "Will you require sponsorship?".into(), options: vec!["Yes".into(), "No".into()] },
+        ];
+        let out = format_questions(&qs);
+        assert!(out.contains("…(+3287 more)"), "{out}");
+        assert!(out.contains("- Will you require sponsorship? [options: Yes | No]"));
+        assert!(out.chars().count() <= 3_100);
+        // many questions: hard cap on the whole section
+        let many: Vec<FormQuestion> = (0..500)
+            .map(|i| FormQuestion { label: format!("Question number {i} about something"), options: vec![] })
+            .collect();
+        let out = format_questions(&many);
+        assert!(out.ends_with("- …(more questions omitted)\n"));
+        assert!(out.chars().count() <= 3_100);
     }
 
     #[test]
