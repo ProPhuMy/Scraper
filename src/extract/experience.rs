@@ -5,7 +5,12 @@ use crate::extract::{ev, Input};
 use crate::model::{Experience, Fact, Source};
 
 static NOT_REQUIRED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bno\s+(?:prior\s+|previous\s+)?experience\s+(?:required|necessary|needed)\b|\bexperience\s+is\s+not\s+required\b")
+    Regex::new(r"\bno\s+(?:[\w-]+\s+){0,3}experience\s+(?:is\s+)?(?:required|necessary|needed)\b|\b(?:(?:internship|work|industry|professional|prior|previous|relevant work)\s+)?experience\b.*?\b(?:is\s+)?not\s+(?:required|necessary|needed)\b")
+        .expect("valid regex")
+});
+
+static ZERO_YEARS_OF_EXP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b0(?:\s*(?:[-–—]|to)\s*\d+|\+)?\s+years?\s+of\s+(?:professional\s+|industry\s+|relevant\s+|work\s+)?experience\b")
         .expect("valid regex")
 });
 
@@ -25,7 +30,7 @@ static FORM_EXP_PREFERRED_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static YEARS_OF_EXP_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b\d+\+?\s+years?\s+of\s+(?:professional\s+|industry\s+|relevant\s+|work\s+)?experience\b")
+    Regex::new(r"\b[1-9]\d*(?:\s*(?:[-–—]|to)\s*\d+|\+)?\s+years?\s+of\s+(?:professional\s+|industry\s+|relevant\s+|work\s+)?experience\b")
         .expect("valid regex")
 });
 
@@ -45,8 +50,9 @@ static YEARS_OF_EXP_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 pub fn experience(inp: &Input) -> Fact<Experience> {
     // 1. Not required. no (prior |previous )?experience (required|necessary|needed) or experience is not required -> NotMentioned, with evidence.
+    // Or a years-of-experience phrase whose number or range starts at 0 -> NotMentioned, with evidence.
     for sent in &inp.sentences {
-        if NOT_REQUIRED_RE.is_match(sent) {
+        if NOT_REQUIRED_RE.is_match(sent) || ZERO_YEARS_OF_EXP_RE.is_match(sent) {
             return Fact {
                 value: Experience::NotMentioned,
                 evidence: ev(Source::Description, sent),
@@ -135,6 +141,13 @@ mod tests {
             ("Experience in C++ is a plus.", NotMentioned),
             ("We value industry experience.", Unknown),
             ("We build robots.", NotMentioned),
+            ("No prior work experience required.", NotMentioned),
+            ("No previous internship experience is necessary.", NotMentioned),
+            ("Prior work experience is not required.", NotMentioned),
+            ("0-2 years of experience.", NotMentioned),
+            ("0+ years of professional experience.", NotMentioned),
+            ("0 to 1 years of experience preferred.", NotMentioned),
+            ("1-3 years of industry experience required.", Required),
         ];
         for (t, want) in cases {
             assert_eq!(experience(&Input::from_text(t)).value, want, "{t}");
