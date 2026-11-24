@@ -143,6 +143,27 @@ fn render_empty_table(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+fn format_mark_cell(starred: bool, applied: bool, is_new: bool, closed: bool) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut prefix = String::new();
+    if starred {
+        prefix.push('★');
+    }
+    if applied {
+        prefix.push('✓');
+    }
+    if is_new {
+        prefix.push('N');
+    }
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)));
+    }
+    if closed {
+        spans.push(Span::styled("✗", Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)));
+    }
+    Line::from(spans)
+}
+
 fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine]) {
     let header_cells = ["MARK", "VERDICT", "YEAR", "COMPANY", "TITLE", "REASON"]
         .into_iter()
@@ -166,17 +187,9 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                 let any_starred = group.rows.iter().any(|r| r.marks().starred);
                 let any_applied = group.rows.iter().any(|r| r.marks().applied_at.is_some());
                 let any_new = group.rows.iter().any(|r| r.is_new());
+                let all_closed = group.rows.iter().all(|r| r.is_closed());
 
-                let mut mark_str = String::new();
-                if any_starred {
-                    mark_str.push('★');
-                }
-                if any_applied {
-                    mark_str.push('✓');
-                }
-                if any_new {
-                    mark_str.push('N');
-                }
+                let mark_cell = format_mark_cell(any_starred, any_applied, any_new, all_closed);
 
                 let (verdict_str, verdict_color) = match newest.judgement.verdict {
                     Verdict::Apply => ("apply", Color::Green),
@@ -200,7 +213,6 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                     .collect();
                 let reason_str = format!("{} locations: {}", group.rows.len(), loc_names.join("; "));
 
-                let mark_span = Span::styled(mark_str, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD));
                 let verdict_span = Span::styled(verdict_str, Style::default().fg(verdict_color));
                 let year_span = Span::styled(year_str, Style::default().fg(Color::White));
                 let company_span = Span::styled(truncate_chars(&newest.row.job.company, 20), Style::default().fg(Color::White));
@@ -208,29 +220,19 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                 let reason_span = Span::styled(truncate_chars(&reason_str, 60), Style::default().fg(Color::DarkGray));
 
                 TableRow::new(vec![
-                    mark_span,
-                    verdict_span,
-                    year_span,
-                    company_span,
-                    title_span,
-                    reason_span,
+                    mark_cell,
+                    verdict_span.into(),
+                    year_span.into(),
+                    company_span.into(),
+                    title_span.into(),
+                    reason_span.into(),
                 ])
             }
             DisplayLine::Child(g_idx, loc_idx) => {
                 let loc_row = &groups[g_idx].rows[loc_idx];
                 let m = loc_row.marks();
-                let mut mark_str = String::new();
-                if m.starred {
-                    mark_str.push('★');
-                }
-                if m.applied_at.is_some() {
-                    mark_str.push('✓');
-                }
-                if loc_row.is_new() {
-                    mark_str.push('N');
-                }
+                let mark_cell = format_mark_cell(m.starred, m.applied_at.is_some(), loc_row.is_new(), loc_row.is_closed());
 
-                let mark_span = Span::styled(mark_str, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD));
                 let verdict_span = Span::raw("");
                 let year_span = Span::raw("");
                 let company_span = Span::raw("");
@@ -238,12 +240,12 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                 let reason_span = Span::styled(truncate_chars(&loc_row.newest().judgement.reason, 60), Style::default().fg(Color::DarkGray));
 
                 TableRow::new(vec![
-                    mark_span,
-                    verdict_span,
-                    year_span,
-                    company_span,
-                    title_span,
-                    reason_span,
+                    mark_cell,
+                    verdict_span.into(),
+                    year_span.into(),
+                    company_span.into(),
+                    title_span.into(),
+                    reason_span.into(),
                 ])
             }
             DisplayLine::Plain(idx) => {
@@ -255,16 +257,7 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                 let newest = loc_row.newest();
 
                 let m = loc_row.marks();
-                let mut mark_str = String::new();
-                if m.starred {
-                    mark_str.push('★');
-                }
-                if m.applied_at.is_some() {
-                    mark_str.push('✓');
-                }
-                if loc_row.is_new() {
-                    mark_str.push('N');
-                }
+                let mark_cell = format_mark_cell(m.starred, m.applied_at.is_some(), loc_row.is_new(), loc_row.is_closed());
 
                 let (verdict_str, verdict_color) = match newest.judgement.verdict {
                     Verdict::Apply => ("apply", Color::Green),
@@ -284,7 +277,6 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                     format!("{} · {}", newest.row.job.title, loc_row.label())
                 };
 
-                let mark_span = Span::styled(mark_str, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD));
                 let verdict_span = Span::styled(verdict_str, Style::default().fg(verdict_color));
                 let year_span = Span::styled(year_str, Style::default().fg(Color::White));
                 let company_span = Span::styled(truncate_chars(&newest.row.job.company, 20), Style::default().fg(Color::White));
@@ -292,12 +284,12 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                 let reason_span = Span::styled(truncate_chars(&newest.judgement.reason, 60), Style::default().fg(Color::DarkGray));
 
                 TableRow::new(vec![
-                    mark_span,
-                    verdict_span,
-                    year_span,
-                    company_span,
-                    title_span,
-                    reason_span,
+                    mark_cell,
+                    verdict_span.into(),
+                    year_span.into(),
+                    company_span.into(),
+                    title_span.into(),
+                    reason_span.into(),
                 ])
             }
         })
@@ -367,24 +359,36 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine]
 
             for loc_row in &group.rows {
                 let m = loc_row.marks();
-                let mut mark_str = String::new();
+                let mut prefix = String::new();
                 if m.starred {
-                    mark_str.push('★');
+                    prefix.push('★');
                 }
                 if m.applied_at.is_some() {
-                    mark_str.push('✓');
+                    prefix.push('✓');
                 }
                 if loc_row.is_new() {
-                    mark_str.push('N');
+                    prefix.push('N');
                 }
-                lines.push(Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:<4}", mark_str),
+                let closed = loc_row.is_closed();
+                let char_count = prefix.chars().count() + if closed { 1 } else { 0 };
+                let pad = 4usize.saturating_sub(char_count);
+
+                let mut spans = vec![Span::raw(" ")];
+                if !prefix.is_empty() {
+                    spans.push(Span::styled(
+                        prefix,
                         Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(loc_row.label(), Style::default().fg(Color::White)),
-                ]));
+                    ));
+                }
+                if closed {
+                    spans.push(Span::styled(
+                        "✗",
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    ));
+                }
+                spans.push(Span::raw(" ".repeat(pad)));
+                spans.push(Span::styled(loc_row.label(), Style::default().fg(Color::White)));
+                lines.push(Line::from(spans));
             }
 
             let paragraph = Paragraph::new(lines).block(block);
@@ -594,6 +598,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" hide  "),
             Span::styled("a", Style::default().fg(Color::Cyan)),
             Span::raw(" applied  "),
+            Span::styled("A", Style::default().fg(Color::Cyan)),
+            Span::raw(" open+apply  "),
             Span::styled("o", Style::default().fg(Color::Cyan)),
             Span::raw(" open  "),
             Span::styled("r", Style::default().fg(Color::Cyan)),
@@ -632,6 +638,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("  s                  Toggle Starred mark"),
         Line::from("  h                  Toggle Hidden mark"),
         Line::from("  a                  Toggle Applied mark"),
+        Line::from("  A                  Open newest link and mark applied"),
         Line::from("  o                  Open posting URL in browser"),
         Line::from("  r                  Refresh jobs (sync + scan)"),
         Line::from(""),
@@ -847,5 +854,28 @@ mod tests {
         terminal.draw(|f| render(f, &app)).unwrap();
         let buf3 = buffer_to_string(terminal.backend().buffer());
         assert!(buf3.contains("a status message"));
+    }
+
+    #[test]
+    fn renders_closed_badge() {
+        let r1 = make_row(
+            1,
+            "OldCorp",
+            "SWE",
+            false,
+            Marks {
+                starred: false,
+                hidden: false,
+                applied_at: Some(100),
+            },
+        );
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        app.tab = Tab::Applied;
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer_str = buffer_to_string(terminal.backend().buffer());
+        assert!(buffer_str.contains("✗"));
     }
 }

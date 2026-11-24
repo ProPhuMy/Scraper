@@ -252,12 +252,25 @@ pub fn render_table(view: &[views::ViewRow], color: bool) -> String {
         if vr.row.is_new {
             mark_text.push('N');
         }
+        let closed = views::is_closed(vr.row);
+        if closed {
+            mark_text.push('✗');
+        }
 
         let mark_char_count = mark_text.chars().count();
         let mark_pad = 4usize.saturating_sub(mark_char_count);
         let formatted_mark = if color {
             if mark_char_count > 0 {
-                format!("{}{}", mark_text.cyan(), " ".repeat(mark_pad))
+                let mut s = String::new();
+                let non_closed: String = mark_text.chars().filter(|&c| c != '✗').collect();
+                if !non_closed.is_empty() {
+                    s.push_str(&format!("{}", non_closed.cyan()));
+                }
+                if closed {
+                    s.push_str(&format!("{}", "✗".dim()));
+                }
+                s.push_str(&" ".repeat(mark_pad));
+                s
             } else {
                 " ".repeat(4)
             }
@@ -316,6 +329,7 @@ pub struct JsonOutput<'a> {
     pub applied_at: Option<i64>,
     pub new: bool,
     pub locations: &'a [String],
+    pub closed: bool,
 }
 
 /// Writes to stdout, treating a closed pipe (`scraper list | head`) as success instead of panicking.
@@ -426,6 +440,7 @@ pub fn list(
                 applied_at: vr.row.marks.applied_at,
                 new: vr.row.is_new,
                 locations: &vr.row.locations,
+                closed: views::is_closed(vr.row),
             })
             .collect();
 
@@ -989,6 +1004,7 @@ mod tests {
             applied_at: view_row.row.marks.applied_at,
             new: view_row.row.is_new,
             locations: &view_row.row.locations,
+            closed: views::is_closed(view_row.row),
         })
         .unwrap();
 
@@ -1067,6 +1083,7 @@ mod tests {
             applied_at: view_row.row.marks.applied_at,
             new: view_row.row.is_new,
             locations: &view_row.row.locations,
+            closed: views::is_closed(view_row.row),
         })
         .unwrap();
 
@@ -1080,5 +1097,65 @@ mod tests {
         assert!(json_val.get("verdict").is_some());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn list_marks_closed() {
+        let row = make_test_row(
+            1,
+            "Acme",
+            "SWE",
+            true,
+            crate::db::Marks { starred: false, hidden: false, applied_at: Some(100) },
+            false,
+            Status::Gone,
+        );
+        let j = Judgement {
+            verdict: Verdict::No,
+            reason: "posting closed".to_string(),
+            year_confirmed: false,
+        };
+        let view = [crate::views::ViewRow { row: &row, judgement: j }];
+        let out = render_table(&view, false);
+        let line = out.lines().nth(1).unwrap();
+        assert!(line.starts_with("✓✗"));
+    }
+
+    #[test]
+    fn json_has_closed() {
+        let row = make_test_row(
+            1,
+            "Acme",
+            "SWE",
+            true,
+            crate::db::Marks::default(),
+            false,
+            Status::Gone,
+        );
+        let j = Judgement {
+            verdict: Verdict::No,
+            reason: "posting closed".to_string(),
+            year_confirmed: false,
+        };
+        let view_row = crate::views::ViewRow { row: &row, judgement: j };
+        let json_val = serde_json::to_value(&JsonOutput {
+            verdict: view_row.judgement.verdict,
+            year_confirmed: view_row.judgement.year_confirmed,
+            company: &view_row.row.job.company,
+            title: &view_row.row.job.title,
+            url: &view_row.row.job.url,
+            reason: &view_row.judgement.reason,
+            status: view_row.row.status,
+            facts: view_row.row.facts.as_ref(),
+            starred: view_row.row.marks.starred,
+            hidden: view_row.row.marks.hidden,
+            applied_at: view_row.row.marks.applied_at,
+            new: view_row.row.is_new,
+            locations: &view_row.row.locations,
+            closed: views::is_closed(view_row.row),
+        })
+        .unwrap();
+
+        assert_eq!(json_val["closed"], true);
     }
 }

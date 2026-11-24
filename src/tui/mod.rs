@@ -58,7 +58,7 @@ fn run_loop(
         if event::poll(std::time::Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    if let Some(action) = app.on_key(key) {
+                    for action in app.on_key(key) {
                         match action {
                             Action::Refresh => {
                                 let tx = tx.clone();

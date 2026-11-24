@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::config::Profile;
 use crate::db::{Marks, Row};
+use crate::model::Status;
 use crate::verdict::{judge, Judgement, Verdict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +39,10 @@ pub fn in_tab(row: &Row, tab: Tab) -> bool {
         Tab::Starred => row.marks.starred && !applied && !row.marks.hidden,
         Tab::Jobs => row.active && !applied && !row.marks.hidden,
     }
+}
+
+pub fn is_closed(row: &Row) -> bool {
+    !row.active || row.status == Status::Gone
 }
 
 pub fn toggle(mut marks: Marks, key: MarkKey, now: i64) -> Result<Marks, &'static str> {
@@ -219,6 +224,10 @@ impl<'a> LocRow<'a> {
 
     pub fn job_ids(&self) -> Vec<i64> {
         self.members.iter().map(|m| m.row.job.id).collect()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.members.iter().all(|m| is_closed(m.row))
     }
 }
 
@@ -1128,5 +1137,44 @@ mod tests {
         let view = build_view(&rows, Tab::Jobs, VerdictFilter::All, "rochester", &profile, 2027);
         assert_eq!(view.len(), 1);
         assert_eq!(view[0].row.job.company, "Acme");
+    }
+
+    #[test]
+    fn is_closed_rules() {
+        let row_inactive = make_row(1, "Acme", "SWE", false, Marks::default(), Status::RulesDone, Some(clean_facts()), 100);
+        let row_gone = make_row(2, "Acme", "SWE", true, Marks::default(), Status::Gone, Some(clean_facts()), 100);
+        let row_open = make_row(3, "Acme", "SWE", true, Marks::default(), Status::RulesDone, Some(clean_facts()), 100);
+
+        assert_eq!(is_closed(&row_inactive), true);
+        assert_eq!(is_closed(&row_gone), true);
+        assert_eq!(is_closed(&row_open), false);
+    }
+
+    #[test]
+    fn closed_only_when_all_members_closed() {
+        let row_gone = make_row(1, "Acme", "SWE", true, Marks::default(), Status::Gone, Some(clean_facts()), 100);
+        let row_open = make_row(2, "Acme", "SWE", true, Marks::default(), Status::RulesDone, Some(clean_facts()), 100);
+        let row_inactive = make_row(3, "Acme", "SWE", false, Marks::default(), Status::RulesDone, Some(clean_facts()), 100);
+
+        let profile = test_profile();
+        let j_gone = judge(row_gone.status, row_gone.facts.as_ref(), &profile, 2027);
+        let j_open = judge(row_open.status, row_open.facts.as_ref(), &profile, 2027);
+        let j_inactive = judge(row_inactive.status, row_inactive.facts.as_ref(), &profile, 2027);
+
+        let loc_mixed = LocRow {
+            members: vec![
+                ViewRow { row: &row_gone, judgement: j_gone.clone() },
+                ViewRow { row: &row_open, judgement: j_open },
+            ],
+        };
+        assert_eq!(loc_mixed.is_closed(), false);
+
+        let loc_all_closed = LocRow {
+            members: vec![
+                ViewRow { row: &row_gone, judgement: j_gone },
+                ViewRow { row: &row_inactive, judgement: j_inactive },
+            ],
+        };
+        assert_eq!(loc_all_closed.is_closed(), true);
     }
 }
