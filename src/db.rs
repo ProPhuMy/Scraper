@@ -9,6 +9,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::model::{Job, NewJob, PortalPage, Facts, Status, Provider};
 
+pub fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock went backwards")
+        .as_secs() as i64
+}
+
 pub fn open(path: &Path) -> anyhow::Result<rusqlite::Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -22,7 +29,7 @@ pub fn open_in_memory() -> anyhow::Result<rusqlite::Connection> {
     Ok(conn)
 }
 
-fn init_schema(conn: &Connection) -> anyhow::Result<()> {
+pub(crate) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY,
@@ -41,9 +48,54 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             last_error TEXT,
             page TEXT,
             facts TEXT,
-            scanned_at INTEGER
+            scanned_at INTEGER,
+            starred INTEGER NOT NULL DEFAULT 0,
+            hidden INTEGER NOT NULL DEFAULT 0,
+            applied_at INTEGER,
+            first_seen INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );"
     )?;
+
+    let mut stmt = conn.prepare("PRAGMA table_info(jobs)")?;
+    let columns: HashSet<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+
+    if !columns.contains("starred") {
+        conn.execute("ALTER TABLE jobs ADD COLUMN starred INTEGER NOT NULL DEFAULT 0", [])?;
+    }
+    if !columns.contains("hidden") {
+        conn.execute("ALTER TABLE jobs ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0", [])?;
+    }
+    if !columns.contains("applied_at") {
+        conn.execute("ALTER TABLE jobs ADD COLUMN applied_at INTEGER", [])?;
+    }
+    if !columns.contains("first_seen") {
+        conn.execute("ALTER TABLE jobs ADD COLUMN first_seen INTEGER", [])?;
+    }
+
+    let sync_count_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM meta WHERE key = 'sync_count'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+
+    if !sync_count_exists {
+        let job_count: i64 = conn.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?;
+        let initial_count = if job_count > 0 { "1" } else { "0" };
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('sync_count', ?1)",
+            params![initial_count],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -61,6 +113,51 @@ pub fn upsert_jobs(conn: &mut Connection, jobs: &[NewJob]) -> anyhow::Result<Syn
 
     let tx = conn.transaction()?;
     tx.execute("UPDATE jobs SET active = 0", [])?;
+
+    let previous_last_sync_at: Option<i64> = tx
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'last_sync_at'",
+            [],
+            |row| {
+                let s: String = row.get(0)?;
+                s.parse::<i64>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                })
+            },
+        )
+        .optional()?;
+
+    let mut now = now_unix();
+    if let Some(prev) = previous_last_sync_at {
+        if now <= prev {
+            now = prev + 1;
+        }
+    }
+
+    let current_sync_count: i64 = tx
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'sync_count'",
+            [],
+            |row| {
+                let s: String = row.get(0)?;
+                s.parse::<i64>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+                })
+            },
+        )
+        .optional()?
+        .unwrap_or(0);
+
+    let next_sync_count = current_sync_count + 1;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('sync_count', ?1)",
+        params![next_sync_count.to_string()],
+    )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_sync_at', ?1)",
+        params![now.to_string()],
+    )?;
 
     let mut seen = HashSet::new();
     let mut inserted = 0;
@@ -88,8 +185,9 @@ pub fn upsert_jobs(conn: &mut Connection, jobs: &[NewJob]) -> anyhow::Result<Syn
                 tx.execute(
                     "INSERT INTO jobs (
                         simplify_id, company, title, category, provider, url,
-                        locations, date_posted, date_updated, active, status, attempts
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, 'pending', 0)",
+                        locations, date_posted, date_updated, active, status, attempts,
+                        first_seen
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, 'pending', 0, ?10)",
                     params![
                         &job.simplify_id,
                         &job.company,
@@ -100,6 +198,7 @@ pub fn upsert_jobs(conn: &mut Connection, jobs: &[NewJob]) -> anyhow::Result<Syn
                         &locations_json,
                         job.date_posted,
                         job.date_updated,
+                        now,
                     ],
                 )?;
                 inserted += 1;
@@ -288,18 +387,61 @@ pub fn save_llm(conn: &Connection, job_id: i64, facts: &Facts) -> anyhow::Result
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct Marks {
+    pub starred: bool,
+    pub hidden: bool,
+    pub applied_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub job: Job,
     pub status: Status,
     pub facts: Option<Facts>,
     pub date_posted: i64,
+    pub active: bool,
+    pub marks: Marks,
+    pub is_new: bool,
+}
+
+pub fn set_marks(conn: &Connection, job_id: i64, marks: Marks) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE jobs SET starred = ?1, hidden = ?2, applied_at = ?3 WHERE id = ?4",
+        params![
+            if marks.starred { 1 } else { 0 },
+            if marks.hidden { 1 } else { 0 },
+            marks.applied_at,
+            job_id,
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
+    let mut last_sync_at: Option<i64> = None;
+    let mut sync_count: i64 = 0;
+
+    let mut meta_stmt = conn.prepare("SELECT key, value FROM meta WHERE key IN ('last_sync_at', 'sync_count')")?;
+    let meta_rows = meta_stmt.query_map([], |r| {
+        let k: String = r.get(0)?;
+        let v: String = r.get(1)?;
+        Ok((k, v))
+    })?;
+    for row in meta_rows {
+        let (k, v) = row?;
+        if k == "last_sync_at" {
+            last_sync_at = v.parse::<i64>().ok();
+        } else if k == "sync_count" {
+            sync_count = v.parse::<i64>().unwrap_or(0);
+        }
+    }
+
     let mut stmt = conn.prepare(
-        "SELECT id, simplify_id, company, title, url, provider, status, facts, date_posted FROM jobs
-         WHERE active = 1
+        "SELECT id, simplify_id, company, title, url, provider, status, facts, date_posted,
+                active, starred, hidden, applied_at, first_seen
+         FROM jobs
+         WHERE active = 1 OR starred = 1 OR hidden = 1 OR applied_at IS NOT NULL
          ORDER BY date_posted DESC"
     )?;
 
@@ -313,9 +455,29 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
         let status_str: String = row.get(6)?;
         let facts_str: Option<String> = row.get(7)?;
         let date_posted: i64 = row.get(8)?;
+        let active_int: i64 = row.get(9)?;
+        let starred_int: i64 = row.get(10)?;
+        let hidden_int: i64 = row.get(11)?;
+        let applied_at: Option<i64> = row.get(12)?;
+        let first_seen: Option<i64> = row.get(13)?;
 
         let provider = Provider::parse(&provider_str);
         let status = Status::parse(&status_str);
+        let active = active_int != 0;
+        let starred = starred_int != 0;
+        let hidden = hidden_int != 0;
+
+        let marks = Marks {
+            starred,
+            hidden,
+            applied_at,
+        };
+
+        let is_new = sync_count >= 2
+            && match (first_seen, last_sync_at) {
+                (Some(fs), Some(ls)) => fs == ls,
+                _ => false,
+            };
 
         Ok((
             Job {
@@ -329,12 +491,15 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
             status,
             facts_str,
             date_posted,
+            active,
+            marks,
+            is_new,
         ))
     })?;
 
     let mut result = Vec::new();
     for r in rows {
-        let (job, status, facts_str, date_posted) = r?;
+        let (job, status, facts_str, date_posted, active, marks, is_new) = r?;
         let facts = match facts_str {
             Some(s) => Some(
                 serde_json::from_str::<Facts>(&s)
@@ -347,6 +512,9 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
             status,
             facts,
             date_posted,
+            active,
+            marks,
+            is_new,
         });
     }
 
@@ -617,5 +785,243 @@ mod tests {
 
         let attempts: i64 = c.query_row("SELECT attempts FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
         assert_eq!(attempts, 0);
+    }
+
+    #[test]
+    fn marks_default_false() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        upsert_jobs(&mut c, &[a]).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].marks, Marks::default());
+        assert!(rows[0].active);
+        assert!(!rows[0].is_new);
+    }
+
+    #[test]
+    fn set_marks_roundtrip() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        upsert_jobs(&mut c, &[a]).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        let id = rows[0].job.id;
+        let marks = Marks {
+            starred: true,
+            hidden: false,
+            applied_at: Some(123),
+        };
+        set_marks(&c, id, marks).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows[0].marks, marks);
+    }
+
+    #[test]
+    fn requeue_keeps_marks() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        upsert_jobs(&mut c, &[a]).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        let id = rows[0].job.id;
+        let marks = Marks {
+            starred: true,
+            hidden: false,
+            applied_at: Some(123),
+        };
+        set_marks(&c, id, marks).unwrap();
+
+        let a_newer = nj("a", 200);
+        upsert_jobs(&mut c, &[a_newer]).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, Status::Pending);
+        assert_eq!(rows[0].marks, marks);
+    }
+
+    #[test]
+    fn list_jobs_keeps_inactive_marked() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        let b = nj("b", 100);
+        let cc = nj("c", 100);
+        upsert_jobs(&mut c, &[a, b, cc]).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        let id_a = rows.iter().find(|r| r.job.simplify_id == "a").unwrap().job.id;
+        let id_b = rows.iter().find(|r| r.job.simplify_id == "b").unwrap().job.id;
+
+        set_marks(
+            &c,
+            id_a,
+            Marks {
+                starred: false,
+                hidden: false,
+                applied_at: Some(123),
+            },
+        )
+        .unwrap();
+        set_marks(
+            &c,
+            id_b,
+            Marks {
+                starred: true,
+                hidden: false,
+                applied_at: None,
+            },
+        )
+        .unwrap();
+
+        let d = nj("d", 100);
+        upsert_jobs(&mut c, &[d]).unwrap();
+
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows.len(), 3);
+        let ids: HashSet<String> = rows.iter().map(|r| r.job.simplify_id.clone()).collect();
+        let expected_ids: HashSet<String> = ["a", "b", "d"].into_iter().map(String::from).collect();
+        assert_eq!(ids, expected_ids);
+
+        let row_a = rows.iter().find(|r| r.job.simplify_id == "a").unwrap();
+        assert!(!row_a.active);
+        let row_b = rows.iter().find(|r| r.job.simplify_id == "b").unwrap();
+        assert!(!row_b.active);
+        let row_d = rows.iter().find(|r| r.job.simplify_id == "d").unwrap();
+        assert!(row_d.active);
+    }
+
+    #[test]
+    fn first_sync_nothing_new() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        let b = nj("b", 100);
+        upsert_jobs(&mut c, &[a, b]).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].is_new);
+        assert!(!rows[1].is_new);
+    }
+
+    #[test]
+    fn second_sync_flags_only_inserted() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        upsert_jobs(&mut c, &[a]).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].is_new);
+
+        let a2 = nj("a", 100);
+        let b = nj("b", 100);
+        upsert_jobs(&mut c, &[a2, b]).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows.len(), 2);
+        let row_a = rows.iter().find(|r| r.job.simplify_id == "a").unwrap();
+        let row_b = rows.iter().find(|r| r.job.simplify_id == "b").unwrap();
+        assert!(!row_a.is_new);
+        assert!(row_b.is_new);
+    }
+
+    #[test]
+    fn migrates_v010_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY,
+                simplify_id TEXT UNIQUE NOT NULL,
+                company TEXT NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                url TEXT NOT NULL,
+                locations TEXT NOT NULL,
+                date_posted INTEGER NOT NULL,
+                date_updated INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                page TEXT,
+                facts TEXT,
+                scanned_at INTEGER
+            );
+            INSERT INTO jobs (
+                simplify_id, company, title, category, provider, url,
+                locations, date_posted, date_updated
+            ) VALUES (
+                'old_1', 'OldCo', 'Engineer', 'Software', 'other', 'https://example.com/old',
+                '[]', 1000, 1000
+            );"
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA table_info(jobs)").unwrap();
+        let cols: HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(cols.contains("starred"));
+        assert!(cols.contains("hidden"));
+        assert!(cols.contains("applied_at"));
+        assert!(cols.contains("first_seen"));
+
+        let rows = list_jobs(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].job.simplify_id, "old_1");
+        assert_eq!(rows[0].marks, Marks::default());
+        assert!(!rows[0].is_new);
+
+        let sync_count: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'sync_count'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync_count, "1");
+    }
+
+    #[test]
+    fn upgraded_db_first_sync_flags_new() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY,
+                simplify_id TEXT UNIQUE NOT NULL,
+                company TEXT NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                url TEXT NOT NULL,
+                locations TEXT NOT NULL,
+                date_posted INTEGER NOT NULL,
+                date_updated INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                page TEXT,
+                facts TEXT,
+                scanned_at INTEGER
+            );
+            INSERT INTO jobs (
+                simplify_id, company, title, category, provider, url,
+                locations, date_posted, date_updated
+            ) VALUES (
+                'old_1', 'OldCo', 'Engineer', 'Software', 'other', 'https://example.com/old',
+                '[]', 1000, 1000
+            );"
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let old_job = nj("old_1", 1000);
+        let new_job = nj("new_1", 1000);
+        upsert_jobs(&mut conn, &[old_job, new_job]).unwrap();
+
+        let rows = list_jobs(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        let row_old = rows.iter().find(|r| r.job.simplify_id == "old_1").unwrap();
+        let row_new = rows.iter().find(|r| r.job.simplify_id == "new_1").unwrap();
+        assert!(!row_old.is_new);
+        assert!(row_new.is_new);
     }
 }
