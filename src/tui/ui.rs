@@ -566,6 +566,11 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" "),
             Span::styled(msg, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
         ])
+    } else if let Some(ref prog) = app.progress {
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(prog, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ])
     } else {
         Line::from(vec![
             Span::raw(" "),
@@ -591,6 +596,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" applied  "),
             Span::styled("o", Style::default().fg(Color::Cyan)),
             Span::raw(" open  "),
+            Span::styled("r", Style::default().fg(Color::Cyan)),
+            Span::raw(" refresh  "),
             Span::styled("tab", Style::default().fg(Color::Cyan)),
             Span::raw(" next  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),
@@ -626,6 +633,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("  h                  Toggle Hidden mark"),
         Line::from("  a                  Toggle Applied mark"),
         Line::from("  o                  Open posting URL in browser"),
+        Line::from("  r                  Refresh jobs (sync + scan)"),
         Line::from(""),
         Line::from("  ?                  Toggle this help overlay"),
         Line::from("  q / Ctrl-C         Quit scraper browse"),
@@ -813,5 +821,31 @@ mod tests {
         terminal.draw(|f| render(f, &app)).unwrap();
         let buf = buffer_to_string(terminal.backend().buffer());
         assert!(buf.contains("(2 links)"));
+    }
+
+    #[test]
+    fn footer_progress_and_key_hints() {
+        let r1 = make_row(1, "Beta", "Dev", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        let backend = TestBackend::new(150, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // 1. Default: contains "r" and "refresh"
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = buffer_to_string(terminal.backend().buffer());
+        assert!(buf.contains("r") && buf.contains("refresh"));
+
+        // 2. Progress set: contains progress text
+        app.progress = Some("syncing\u{2026}".to_string());
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf2 = buffer_to_string(terminal.backend().buffer());
+        assert!(buf2.contains("syncing\u{2026}"));
+
+        // 3. Status msg set: overrides progress
+        app.status_msg = Some("a status message".to_string());
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf3 = buffer_to_string(terminal.backend().buffer());
+        assert!(buf3.contains("a status message"));
     }
 }

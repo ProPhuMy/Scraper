@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use crate::commands::Progress;
 use crate::config::{Config, Profile};
 use crate::db::{now_unix, Marks, Row};
 use crate::verdict::Verdict;
@@ -12,6 +13,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 pub enum Action {
     SaveMarks(Vec<(i64, Marks)>),
     OpenUrl(String),
+    Refresh,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,11 @@ pub struct App {
     pub profile: Profile,
     pub expanded: HashSet<String>,
     pub lines: Vec<Line>,
+    pub refreshing: bool,
+    pub progress: Option<String>,
+    pub(crate) refresh_inserted: usize,
+    pub(crate) refresh_scanned: usize,
+    pub(crate) refresh_llm_note: Option<&'static str>,
 }
 
 impl App {
@@ -78,6 +85,11 @@ impl App {
             profile: cfg.profile.clone(),
             expanded: HashSet::new(),
             lines: Vec::new(),
+            refreshing: false,
+            progress: None,
+            refresh_inserted: 0,
+            refresh_scanned: 0,
+            refresh_llm_note: None,
         };
         app.rebuild_lines();
         app.clamp_selected();
@@ -428,6 +440,20 @@ impl App {
                     None => None,
                 }
             }
+            KeyCode::Char('r') => {
+                if self.refreshing {
+                    self.status_msg = Some("refresh already running".to_string());
+                    None
+                } else {
+                    self.refreshing = true;
+                    self.refresh_inserted = 0;
+                    self.refresh_scanned = 0;
+                    self.refresh_llm_note = None;
+                    self.progress = Some("syncing\u{2026}".to_string());
+                    self.status_msg = None;
+                    Some(Action::Refresh)
+                }
+            }
             _ => None,
         }
     }
@@ -490,6 +516,140 @@ impl App {
                 None
             }
         }
+    }
+
+    pub fn on_progress(&mut self, p: &Progress) {
+        self.status_msg = None;
+        match p {
+            Progress::Synced { total, inserted, .. } => {
+                self.refresh_inserted = *inserted;
+                self.progress = Some(format!("synced {total} jobs: {inserted} new"));
+            }
+            Progress::NothingToScan => {
+                self.refresh_scanned = 0;
+                self.progress = Some("nothing new to scan".to_string());
+            }
+            Progress::ScanStarted { total } => {
+                self.progress = Some(format!("scanning 0/{total}"));
+            }
+            Progress::Scanned { done, total, .. } => {
+                self.progress = Some(format!("scanning {done}/{total}"));
+            }
+            Progress::ScanFinished { rules_done, unreadable, gone, error } => {
+                self.refresh_scanned = rules_done + unreadable + gone + error;
+            }
+            Progress::LlmStarted { total } => {
+                self.progress = Some(format!("LLM 0/{total}"));
+            }
+            Progress::LlmDone { done, total } => {
+                self.progress = Some(format!("LLM {done}/{total}"));
+            }
+            Progress::LlmQuota => {
+                self.refresh_llm_note = Some("(LLM: quota reached)");
+            }
+            Progress::LlmClientError(_) => {
+                self.refresh_llm_note = Some("(LLM: not set up)");
+            }
+            _ => {}
+        }
+    }
+
+    pub fn on_refresh_finished(&mut self, result: Result<(), String>, rows: Vec<Row>) {
+        self.refreshing = false;
+        self.status_msg = None;
+        match result {
+            Ok(()) => {
+                let note_suffix = self.refresh_llm_note.map(|n| format!(" {n}")).unwrap_or_default();
+                self.progress = Some(format!(
+                    "refresh done: {} new, {} scanned{note_suffix}",
+                    self.refresh_inserted, self.refresh_scanned
+                ));
+            }
+            Err(e) => {
+                self.progress = Some(format!("refresh failed: {e}"));
+            }
+        }
+
+        let selected_job_id = self.selected_job_id();
+        self.rows = rows;
+        self.rebuild_lines();
+
+        if let Some(job_id) = selected_job_id {
+            if let Some(pos) = self.find_line_with_job_id(job_id) {
+                self.selected = pos;
+            } else {
+                self.clamp_selected();
+            }
+        } else {
+            self.clamp_selected();
+        }
+    }
+
+    fn selected_job_id(&self) -> Option<i64> {
+        let line = *self.lines.get(self.selected)?;
+        let view = self.visible_rows();
+        let loc_rows = merge_locations(view);
+        match line {
+            Line::Plain(idx) => {
+                if self.tab == Tab::Jobs {
+                    let groups = group_view(loc_rows);
+                    Some(groups.get(idx)?.rows.get(0)?.newest().row.job.id)
+                } else {
+                    Some(loc_rows.get(idx)?.newest().row.job.id)
+                }
+            }
+            Line::Header(g_idx) => {
+                let groups = group_view(loc_rows);
+                Some(groups.get(g_idx)?.rows.get(0)?.newest().row.job.id)
+            }
+            Line::Child(g_idx, loc_idx) => {
+                let groups = group_view(loc_rows);
+                Some(groups.get(g_idx)?.rows.get(loc_idx)?.newest().row.job.id)
+            }
+        }
+    }
+
+    fn find_line_with_job_id(&self, job_id: i64) -> Option<usize> {
+        let view = self.visible_rows();
+        let loc_rows = merge_locations(view);
+        let groups = if self.tab == Tab::Jobs {
+            group_view(loc_rows.clone())
+        } else {
+            Vec::new()
+        };
+
+        for (pos, &line) in self.lines.iter().enumerate() {
+            match line {
+                Line::Plain(idx) => {
+                    if self.tab == Tab::Jobs {
+                        if let Some(loc_row) = groups.get(idx).and_then(|g| g.rows.get(0)) {
+                            if loc_row.job_ids().contains(&job_id) {
+                                return Some(pos);
+                            }
+                        }
+                    } else if let Some(loc_row) = loc_rows.get(idx) {
+                        if loc_row.job_ids().contains(&job_id) {
+                            return Some(pos);
+                        }
+                    }
+                }
+                Line::Header(g_idx) => {
+                    if let Some(group) = groups.get(g_idx) {
+                        if group.rows.iter().any(|r| r.job_ids().contains(&job_id)) {
+                            return Some(pos);
+                        }
+                    }
+                }
+                Line::Child(g_idx, loc_idx) => {
+                    if let Some(loc_row) = groups.get(g_idx).and_then(|g| g.rows.get(loc_idx)) {
+                        if loc_row.job_ids().contains(&job_id) {
+                            return Some(pos);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -797,5 +957,134 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
         let action = app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
         assert_eq!(action, Some(Action::OpenUrl("https://example.com/job/2".into())));
+    }
+
+    #[test]
+    fn r_emits_refresh_once() {
+        let r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        assert!(!app.refreshing);
+        assert_eq!(app.progress, None);
+
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty());
+        let action = app.on_key(key);
+        assert_eq!(action, Some(Action::Refresh));
+        assert!(app.refreshing);
+        assert_eq!(app.progress.as_deref(), Some("syncing\u{2026}"));
+
+        let action2 = app.on_key(key);
+        assert_eq!(action2, None);
+        assert!(app.refreshing);
+        assert_eq!(app.status_msg.as_deref(), Some("refresh already running"));
+    }
+
+    #[test]
+    fn progress_text() {
+        let r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+
+        app.on_progress(&crate::commands::Progress::Synced {
+            total: 1801,
+            inserted: 3,
+            requeued: 0,
+        });
+        assert_eq!(app.progress.as_deref(), Some("synced 1801 jobs: 3 new"));
+
+        app.on_progress(&crate::commands::Progress::Scanned {
+            done: 412,
+            total: 1801,
+            status: Status::RulesDone,
+            company: "Acme".into(),
+            title: "SWE Intern".into(),
+        });
+        assert_eq!(app.progress.as_deref(), Some("scanning 412/1801"));
+
+        app.on_progress(&crate::commands::Progress::LlmDone {
+            done: 12,
+            total: 385,
+        });
+        assert_eq!(app.progress.as_deref(), Some("LLM 12/385"));
+
+        app.on_progress(&crate::commands::Progress::NothingToScan);
+        assert_eq!(app.progress.as_deref(), Some("nothing new to scan"));
+    }
+
+    #[test]
+    fn finished_summary_and_reload_keeps_selection() {
+        let cfg = test_config();
+        let initial_rows = vec![
+            make_row(100, "Comp A", "SWE", true, Marks::default()),
+            make_row(101, "Comp B", "SWE", true, Marks::default()),
+            make_row(102, "Comp C", "SWE", true, Marks::default()),
+            make_row(103, "Comp D", "SWE", true, Marks::default()),
+            make_row(104, "Comp E", "SWE", true, Marks::default()),
+            make_row(42, "Target Comp", "SWE", true, Marks::default()),
+            make_row(105, "Comp F", "SWE", true, Marks::default()),
+        ];
+        let mut app = App::new(initial_rows, &cfg);
+        app.selected = 5;
+        assert_eq!(app.selected, 5);
+
+        let new_rows = vec![
+            make_row(200, "Comp 0", "SWE", true, Marks::default()),
+            make_row(201, "Comp 1", "SWE", true, Marks::default()),
+            make_row(202, "Comp 2", "SWE", true, Marks::default()),
+            make_row(203, "Comp 3", "SWE", true, Marks::default()),
+            make_row(204, "Comp 4", "SWE", true, Marks::default()),
+            make_row(205, "Comp 5", "SWE", true, Marks::default()),
+            make_row(206, "Comp 6", "SWE", true, Marks::default()),
+            make_row(42, "Target Comp", "SWE", true, Marks::default()),
+            make_row(207, "Comp 7", "SWE", true, Marks::default()),
+        ];
+
+        app.refreshing = true;
+        app.on_progress(&crate::commands::Progress::Synced {
+            total: 9,
+            inserted: 8,
+            requeued: 0,
+        });
+        app.on_progress(&crate::commands::Progress::ScanFinished {
+            rules_done: 9,
+            unreadable: 0,
+            gone: 0,
+            error: 0,
+        });
+        app.on_refresh_finished(Ok(()), new_rows);
+
+        assert_eq!(app.selected, 7);
+        assert!(!app.refreshing);
+        assert!(app.progress.as_ref().unwrap().starts_with("refresh done"));
+    }
+
+    #[test]
+    fn finished_error() {
+        let r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1.clone()], &cfg);
+        app.refreshing = true;
+        app.on_refresh_finished(Err("network down".into()), vec![r1]);
+        assert_eq!(
+            app.progress.as_deref(),
+            Some("refresh failed: network down")
+        );
+        assert!(!app.refreshing);
+    }
+
+    #[test]
+    fn quota_note() {
+        let r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1.clone()], &cfg);
+        app.refreshing = true;
+        app.on_progress(&crate::commands::Progress::LlmQuota);
+        app.on_refresh_finished(Ok(()), vec![r1]);
+        assert!(
+            app.progress
+                .as_ref()
+                .unwrap()
+                .contains("(LLM: quota reached)")
+        );
     }
 }
