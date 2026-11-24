@@ -1,0 +1,13 @@
+season_year = 2027
+
+[profile]
+class_year = 1
+# gpa = 3.5 # Omit if you have no GPA yet
+needs_sponsorship = true
+has_prior_internship = false
+
+# [llm]
+# base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+# model = "gemini-2.5-flash"
+# api_key_env = "LLM_API_KEY"
+# requests_per_minute = 10
