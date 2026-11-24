@@ -9,6 +9,7 @@ mod portals;
 mod verdict;
 mod views;
 mod llm;
+mod tui;
 
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
@@ -45,6 +46,7 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    Browse,
 }
 
 #[tokio::main]
@@ -67,6 +69,10 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let cfg = config::load(&cli.config)?;
             verdict::list(&cfg, &cli.db, year, verdict, all, json)
+        }
+        Commands::Browse => {
+            let cfg = config::load(&cli.config)?;
+            tui::run(&cfg, &cli.db)
         }
     }
 }
