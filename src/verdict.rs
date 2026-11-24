@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
+use std::io::IsTerminal;
 use std::path::Path;
+use ratatui::crossterm::style::Stylize;
 use serde::Serialize;
 use crate::config::{Config, Profile};
 use crate::db;
@@ -9,6 +11,7 @@ use crate::model::{
     Sponsorship, Status,
 };
 use crate::text::truncate_chars;
+use crate::views::{self, Tab};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -204,6 +207,116 @@ pub fn judge(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListFlags {
+    pub all: bool,
+    pub starred: bool,
+    pub applied: bool,
+    pub new: bool,
+}
+
+pub fn select_rows<'a>(rows: &'a [db::Row], flags: ListFlags) -> Vec<&'a db::Row> {
+    rows.iter()
+        .filter(|row| {
+            if flags.applied {
+                views::in_tab(row, Tab::Applied)
+            } else if flags.starred {
+                views::in_tab(row, Tab::Starred)
+            } else if flags.all {
+                row.active && (views::in_tab(row, Tab::Jobs) || views::in_tab(row, Tab::Hidden))
+            } else {
+                views::in_tab(row, Tab::Jobs)
+            }
+        })
+        .filter(|row| !flags.new || row.is_new)
+        .collect()
+}
+
+pub fn render_table(view: &[views::ViewRow], color: bool) -> String {
+    let header = format!(
+        "{:<4} {:<7} {:<5} {:<20} {:<40} {:<60} {}",
+        "MARK", "VERDICT", "YEAR", "COMPANY", "TITLE", "REASON", "URL"
+    );
+
+    let mut lines = Vec::with_capacity(view.len() + 1);
+    lines.push(header);
+
+    for vr in view {
+        let mut mark_text = String::new();
+        if vr.row.marks.starred {
+            mark_text.push('★');
+        }
+        if vr.row.marks.applied_at.is_some() {
+            mark_text.push('✓');
+        }
+        if vr.row.is_new {
+            mark_text.push('N');
+        }
+
+        let mark_char_count = mark_text.chars().count();
+        let mark_pad = 4usize.saturating_sub(mark_char_count);
+        let formatted_mark = if color {
+            if mark_char_count > 0 {
+                format!("{}{}", mark_text.cyan(), " ".repeat(mark_pad))
+            } else {
+                " ".repeat(4)
+            }
+        } else {
+            format!("{}{}", mark_text, " ".repeat(mark_pad))
+        };
+
+        let formatted_verdict = if color {
+            match vr.judgement.verdict {
+                Verdict::Apply => format!("{}  ", "apply".green()),
+                Verdict::Maybe => format!("{}  ", "maybe".yellow()),
+                Verdict::No => format!("{}     ", "no".red()),
+            }
+        } else {
+            match vr.judgement.verdict {
+                Verdict::Apply => format!("{:<7}", "apply"),
+                Verdict::Maybe => format!("{:<7}", "maybe"),
+                Verdict::No => format!("{:<7}", "no"),
+            }
+        };
+
+        let year_str = if vr.judgement.year_confirmed {
+            "yes"
+        } else {
+            "year?"
+        };
+        let formatted_year = format!("{:<5}", year_str);
+        let trunc_company = truncate_chars(&vr.row.job.company, 20);
+        let formatted_company = format!("{:<20}", trunc_company);
+        let trunc_title = truncate_chars(&vr.row.job.title, 40);
+        let formatted_title = format!("{:<40}", trunc_title);
+        let trunc_reason = truncate_chars(&vr.judgement.reason, 60);
+        let formatted_reason = format!("{:<60}", trunc_reason);
+
+        lines.push(format!(
+            "{formatted_mark} {formatted_verdict} {formatted_year} {formatted_company} {formatted_title} {formatted_reason} {}",
+            vr.row.job.url
+        ));
+    }
+
+    lines.join("\n")
+}
+
+#[derive(Serialize)]
+pub struct JsonOutput<'a> {
+    pub verdict: Verdict,
+    pub year_confirmed: bool,
+    pub company: &'a str,
+    pub title: &'a str,
+    pub url: &'a str,
+    pub reason: &'a str,
+    pub status: Status,
+    pub facts: Option<&'a Facts>,
+    pub starred: bool,
+    pub hidden: bool,
+    pub applied_at: Option<i64>,
+    pub new: bool,
+}
+
 pub fn list(
     cfg: &Config,
     db_path: &Path,
@@ -211,6 +324,9 @@ pub fn list(
     verdict: Option<String>,
     all: bool,
     json: bool,
+    starred: bool,
+    applied: bool,
+    new: bool,
 ) -> anyhow::Result<()> {
     let profile = if let Some(n) = year {
         if !(1..=4).contains(&n) {
@@ -238,96 +354,75 @@ pub fn list(
     let conn = db::open(db_path)?;
     let rows = db::list_jobs(&conn)?;
 
-    struct Item {
-        row: db::Row,
-        judgement: Judgement,
-    }
+    let flags = ListFlags {
+        all,
+        starred,
+        applied,
+        new,
+    };
 
-    let mut items: Vec<Item> = rows
+    let selected_rows = select_rows(&rows, flags);
+
+    let mut view_rows: Vec<views::ViewRow> = selected_rows
         .into_iter()
         .map(|row| {
             let judgement = judge(row.status, row.facts.as_ref(), &profile, cfg.season_year);
-            Item { row, judgement }
+            views::ViewRow { row, judgement }
         })
         .collect();
 
-    let a_count = items.iter().filter(|i| i.judgement.verdict == Verdict::Apply).count();
-    let m_count = items.iter().filter(|i| i.judgement.verdict == Verdict::Maybe).count();
-    let n_count = items.iter().filter(|i| i.judgement.verdict == Verdict::No).count();
+    let a_count = view_rows.iter().filter(|i| i.judgement.verdict == Verdict::Apply).count();
+    let m_count = view_rows.iter().filter(|i| i.judgement.verdict == Verdict::Maybe).count();
+    let n_count = view_rows.iter().filter(|i| i.judgement.verdict == Verdict::No).count();
 
-    // If --verdict is given it wins over --all. Default shows apply + maybe.
-    items.retain(|item| {
+    // If --verdict is given it filters; otherwise Jobs uses ApplyMaybe, while Starred/Applied/All show all verdicts
+    view_rows.retain(|vr| {
         if let Some(tv) = target_verdict {
-            item.judgement.verdict == tv
-        } else if all {
+            vr.judgement.verdict == tv
+        } else if starred || applied || all {
             true
         } else {
-            matches!(item.judgement.verdict, Verdict::Apply | Verdict::Maybe)
+            matches!(vr.judgement.verdict, Verdict::Apply | Verdict::Maybe)
         }
     });
 
-    items.sort_by_key(|item| item.judgement.verdict);
+    if applied {
+        view_rows.sort_by_key(|vr| std::cmp::Reverse(vr.row.marks.applied_at));
+    } else {
+        view_rows.sort_by_key(|vr| {
+            (
+                !vr.row.marks.starred,
+                vr.judgement.verdict,
+                std::cmp::Reverse(vr.row.date_posted),
+            )
+        });
+    }
 
     if json {
-        #[derive(Serialize)]
-        struct JsonOutput<'a> {
-            verdict: Verdict,
-            year_confirmed: bool,
-            company: &'a str,
-            title: &'a str,
-            url: &'a str,
-            reason: &'a str,
-            status: Status,
-            facts: Option<&'a Facts>,
-        }
-
-        let json_items: Vec<JsonOutput> = items
+        let json_items: Vec<JsonOutput> = view_rows
             .iter()
-            .map(|item| JsonOutput {
-                verdict: item.judgement.verdict,
-                year_confirmed: item.judgement.year_confirmed,
-                company: &item.row.job.company,
-                title: &item.row.job.title,
-                url: &item.row.job.url,
-                reason: &item.judgement.reason,
-                status: item.row.status,
-                facts: item.row.facts.as_ref(),
+            .map(|vr| JsonOutput {
+                verdict: vr.judgement.verdict,
+                year_confirmed: vr.judgement.year_confirmed,
+                company: &vr.row.job.company,
+                title: &vr.row.job.title,
+                url: &vr.row.job.url,
+                reason: &vr.judgement.reason,
+                status: vr.row.status,
+                facts: vr.row.facts.as_ref(),
+                starred: vr.row.marks.starred,
+                hidden: vr.row.marks.hidden,
+                applied_at: vr.row.marks.applied_at,
+                new: vr.row.is_new,
             })
             .collect();
 
         println!("{}", serde_json::to_string_pretty(&json_items)?);
     } else {
-        println!(
-            "{:<7} {:<5} {:<20} {:<40} {:<60} {}",
-            "VERDICT", "YEAR", "COMPANY", "TITLE", "REASON", "URL"
-        );
-
-        for item in &items {
-            let verdict_str = match item.judgement.verdict {
-                Verdict::Apply => "apply",
-                Verdict::Maybe => "maybe",
-                Verdict::No => "no",
-            };
-            let year_str = if item.judgement.year_confirmed {
-                "yes"
-            } else {
-                "year?"
-            };
-            let trunc_company = truncate_chars(&item.row.job.company, 20);
-            let trunc_title = truncate_chars(&item.row.job.title, 40);
-            let trunc_reason = truncate_chars(&item.judgement.reason, 60);
-
-            println!(
-                "{:<7} {:<5} {:<20} {:<40} {:<60} {}",
-                verdict_str,
-                year_str,
-                trunc_company,
-                trunc_title,
-                trunc_reason,
-                item.row.job.url
-            );
-        }
-
+        let color = std::io::stdout().is_terminal()
+            && std::env::var_os("NO_COLOR").map_or(true, |v| v.is_empty());
+        let table = render_table(&view_rows, color);
+        println!("{table}");
         println!("{a_count} apply, {m_count} maybe, {n_count} no");
     }
 
@@ -578,10 +673,10 @@ mod tests {
         let cfg = crate::config::parse(toml_str).unwrap();
         let db_path = Path::new("dummy.db");
 
-        let err0 = list(&cfg, db_path, Some(0), None, false, false).unwrap_err().to_string();
+        let err0 = list(&cfg, db_path, Some(0), None, false, false, false, false, false).unwrap_err().to_string();
         assert!(err0.contains("year must be between 1 and 4"));
 
-        let err5 = list(&cfg, db_path, Some(5), None, false, false).unwrap_err().to_string();
+        let err5 = list(&cfg, db_path, Some(5), None, false, false, false, false, false).unwrap_err().to_string();
         assert!(err5.contains("year must be between 1 and 4"));
     }
 
@@ -596,7 +691,7 @@ mod tests {
         let cfg = crate::config::parse(toml_str).unwrap();
         let db_path = Path::new("dummy.db");
 
-        let err = list(&cfg, db_path, None, Some("foo".to_string()), false, false).unwrap_err().to_string();
+        let err = list(&cfg, db_path, None, Some("foo".to_string()), false, false, false, false, false).unwrap_err().to_string();
         assert!(err.contains("invalid verdict 'foo'"));
     }
 
@@ -661,16 +756,243 @@ mod tests {
         }
 
         // Test default table run (shows apply, hides no)
-        assert!(list(&cfg, &db_path, None, None, false, false).is_ok());
+        assert!(list(&cfg, &db_path, None, None, false, false, false, false, false).is_ok());
 
         // Test with --all
-        assert!(list(&cfg, &db_path, None, None, true, false).is_ok());
+        assert!(list(&cfg, &db_path, None, None, true, false, false, false, false).is_ok());
 
         // Test with --verdict no
-        assert!(list(&cfg, &db_path, None, Some("no".to_string()), false, false).is_ok());
+        assert!(list(&cfg, &db_path, None, Some("no".to_string()), false, false, false, false, false).is_ok());
 
         // Test with --json
-        assert!(list(&cfg, &db_path, None, None, false, true).is_ok());
+        assert!(list(&cfg, &db_path, None, None, false, true, false, false, false).is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    fn make_test_row(
+        id: i64,
+        company: &str,
+        title: &str,
+        active: bool,
+        marks: crate::db::Marks,
+        is_new: bool,
+        status: Status,
+    ) -> crate::db::Row {
+        crate::db::Row {
+            job: crate::model::Job {
+                id,
+                simplify_id: format!("job_{id}"),
+                company: company.to_string(),
+                title: title.to_string(),
+                url: format!("https://example.com/job/{id}"),
+                provider: Provider::Other,
+            },
+            status,
+            facts: Some(clean()),
+            date_posted: 100,
+            active,
+            marks,
+            is_new,
+        }
+    }
+
+    #[test]
+    fn no_color_when_disabled() {
+        let row = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        let judgement = Judgement {
+            verdict: Verdict::Apply,
+            reason: "no blockers found".to_string(),
+            year_confirmed: true,
+        };
+        let view = [crate::views::ViewRow { row: &row, judgement }];
+        let out = render_table(&view, false);
+        assert!(!out.contains('\x1b'));
+        assert!(out.contains("apply"));
+    }
+
+    #[test]
+    fn color_when_enabled() {
+        let row = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        let judgement = Judgement {
+            verdict: Verdict::Apply,
+            reason: "no blockers found".to_string(),
+            year_confirmed: true,
+        };
+        let view = [crate::views::ViewRow { row: &row, judgement }];
+        let out = render_table(&view, true);
+        assert!(out.contains('\x1b'));
+        assert!(out.contains("apply"));
+    }
+
+    #[test]
+    fn marks_column() {
+        let row1 = make_test_row(
+            1,
+            "Acme",
+            "SWE",
+            true,
+            crate::db::Marks { starred: true, hidden: false, applied_at: None },
+            true,
+            Status::RulesDone,
+        );
+        let row2 = make_test_row(
+            2,
+            "Beta",
+            "MLE",
+            true,
+            crate::db::Marks { starred: false, hidden: false, applied_at: Some(100) },
+            false,
+            Status::RulesDone,
+        );
+        let j1 = Judgement {
+            verdict: Verdict::Apply,
+            reason: "no blockers found".to_string(),
+            year_confirmed: true,
+        };
+        let j2 = Judgement {
+            verdict: Verdict::Maybe,
+            reason: "not scanned yet".to_string(),
+            year_confirmed: false,
+        };
+        let view = [
+            crate::views::ViewRow { row: &row1, judgement: j1 },
+            crate::views::ViewRow { row: &row2, judgement: j2 },
+        ];
+        let out = render_table(&view, false);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.len() >= 3);
+        assert!(lines[1].starts_with("★N"));
+        assert!(lines[2].starts_with("✓"));
+    }
+
+    #[test]
+    fn hidden_excluded_by_default() {
+        let normal = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        let hidden = make_test_row(
+            2,
+            "HideCorp",
+            "SWE",
+            true,
+            crate::db::Marks { starred: false, hidden: true, applied_at: None },
+            false,
+            Status::RulesDone,
+        );
+        let rows = [normal, hidden];
+
+        let default_flags = ListFlags::default();
+        let selected_default = select_rows(&rows, default_flags);
+        assert_eq!(selected_default.len(), 1);
+        assert_eq!(selected_default[0].job.simplify_id, "job_1");
+
+        let all_flags = ListFlags { all: true, ..Default::default() };
+        let selected_all = select_rows(&rows, all_flags);
+        assert_eq!(selected_all.len(), 2);
+    }
+
+    #[test]
+    fn applied_flag_shows_closed_posting() {
+        let applied_closed = make_test_row(
+            1,
+            "OldCorp",
+            "SWE",
+            false,
+            crate::db::Marks { starred: false, hidden: false, applied_at: Some(100) },
+            false,
+            Status::Gone,
+        );
+        let rows = [applied_closed];
+        let flags = ListFlags { applied: true, ..Default::default() };
+        let selected = select_rows(&rows, flags);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].job.simplify_id, "job_1");
+    }
+
+    #[test]
+    fn json_has_new_fields() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let toml_str = r#"
+            [profile]
+            class_year = 1
+            needs_sponsorship = false
+            has_prior_internship = false
+        "#;
+        let cfg = crate::config::parse(toml_str).unwrap();
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("test_json_fields_{}", nanos));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        {
+            let mut conn = db::open(&db_path).unwrap();
+            let nj1 = NewJob {
+                simplify_id: "job1".to_string(),
+                company: "CleanCorp".to_string(),
+                title: "SWE Intern".to_string(),
+                category: "Software".to_string(),
+                url: "https://example.com/job1".to_string(),
+                provider: Provider::Other,
+                locations: vec!["Remote".to_string()],
+                date_posted: 100,
+                date_updated: 100,
+            };
+            db::upsert_jobs(&mut conn, &[nj1]).unwrap();
+            db::set_marks(
+                &conn,
+                1,
+                crate::db::Marks {
+                    starred: true,
+                    hidden: false,
+                    applied_at: Some(12345),
+                },
+            )
+            .unwrap();
+        }
+
+        assert!(list(&cfg, &db_path, None, None, false, true, false, true, false).is_ok());
+
+        let conn = db::open(&db_path).unwrap();
+        let rows = db::list_jobs(&conn).unwrap();
+        let flags = ListFlags { applied: true, ..Default::default() };
+        let selected = select_rows(&rows, flags);
+        let j = judge(selected[0].status, selected[0].facts.as_ref(), &cfg.profile, cfg.season_year);
+        let view_row = crate::views::ViewRow { row: selected[0], judgement: j };
+        let json_val = serde_json::to_value(&JsonOutput {
+            verdict: view_row.judgement.verdict,
+            year_confirmed: view_row.judgement.year_confirmed,
+            company: &view_row.row.job.company,
+            title: &view_row.row.job.title,
+            url: &view_row.row.job.url,
+            reason: &view_row.judgement.reason,
+            status: view_row.row.status,
+            facts: view_row.row.facts.as_ref(),
+            starred: view_row.row.marks.starred,
+            hidden: view_row.row.marks.hidden,
+            applied_at: view_row.row.marks.applied_at,
+            new: view_row.row.is_new,
+        })
+        .unwrap();
+
+        assert!(json_val.get("starred").is_some());
+        assert!(json_val.get("hidden").is_some());
+        assert!(json_val.get("applied_at").is_some());
+        assert!(json_val.get("new").is_some());
+
+        assert!(json_val.get("verdict").is_some());
+        assert!(json_val.get("year_confirmed").is_some());
+        assert!(json_val.get("company").is_some());
+        assert!(json_val.get("title").is_some());
+        assert!(json_val.get("url").is_some());
+        assert!(json_val.get("reason").is_some());
+        assert!(json_val.get("status").is_some());
+        assert!(json_val.get("facts").is_some());
+
+        assert_eq!(json_val["starred"], true);
+        assert_eq!(json_val["hidden"], false);
+        assert_eq!(json_val["applied_at"], 12345);
+        assert_eq!(json_val["new"], false);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

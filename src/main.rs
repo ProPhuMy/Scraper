@@ -44,6 +44,12 @@ pub enum Commands {
         all: bool,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        starred: bool,
+        #[arg(long)]
+        applied: bool,
+        #[arg(long)]
+        new: bool,
     },
 }
 
@@ -64,9 +70,22 @@ async fn main() -> anyhow::Result<()> {
             verdict,
             all,
             json,
+            starred,
+            applied,
+            new,
         } => {
             let cfg = config::load(&cli.config)?;
-            verdict::list(&cfg, &cli.db, year, verdict, all, json)
+            verdict::list(
+                &cfg,
+                &cli.db,
+                year,
+                verdict,
+                all,
+                json,
+                starred,
+                applied,
+                new,
+            )
         }
     }
 }
