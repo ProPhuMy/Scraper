@@ -3,6 +3,7 @@ mod db;
 mod model;
 mod text;
 mod simplify;
+mod verdict;
 
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
@@ -47,6 +48,14 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Sync => anyhow::bail!("not implemented yet"),
         Commands::Scan { .. } => anyhow::bail!("not implemented yet"),
-        Commands::List { .. } => anyhow::bail!("not implemented yet"),
+        Commands::List {
+            year,
+            verdict,
+            all,
+            json,
+        } => {
+            let cfg = config::load(&cli.config)?;
+            verdict::list(&cfg, &cli.db, year, verdict, all, json)
+        }
     }
 }
