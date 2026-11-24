@@ -3,6 +3,7 @@ mod db;
 mod model;
 mod text;
 mod simplify;
+mod portals;
 
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
