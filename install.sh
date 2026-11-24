@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="ProPhuMy/scratch"
+REPO="ProPhuMy/Scraper"
 INSTALL_DIR="${SCRAPER_INSTALL_DIR:-$HOME/.local/bin}"
 
 # 1. Detect OS

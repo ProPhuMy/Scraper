@@ -13,7 +13,7 @@ Many job postings never say outright whether they take first-years, need a GPA, 
 Linux, macOS, or Windows (Git Bash):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ProPhuMy/scratch/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ProPhuMy/Scraper/main/install.sh | sh
 ```
 
 The script picks the right build for your system, checks its SHA-256 checksum, and installs it to `~/.local/bin`. Optional environment variables:
@@ -28,7 +28,7 @@ The script picks the right build for your system, checks its SHA-256 checksum, a
 Download the config template and fill in your profile:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ProPhuMy/scratch/main/scraper.example.toml -o scraper.toml
+curl -fsSL https://raw.githubusercontent.com/ProPhuMy/Scraper/main/scraper.example.toml -o scraper.toml
 ```
 
 ```toml
