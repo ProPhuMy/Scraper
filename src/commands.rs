@@ -110,7 +110,7 @@ pub fn format_progress(p: &Progress) -> Option<(bool, String)> {
             false,
             format!("synced {total} jobs: {inserted} new, {requeued} updated"),
         )),
-        Progress::NothingToScan => Some((false, "nothing to scan".to_string())),
+        Progress::NothingToScan => Some((false, "no new job pages to fetch".to_string())),
         Progress::ScanStarted { .. } => None,
         Progress::Scanned {
             done,
@@ -600,7 +600,7 @@ mod tests {
         );
         assert_eq!(
             format_progress(&Progress::NothingToScan),
-            Some((false, "nothing to scan".into()))
+            Some((false, "no new job pages to fetch".into()))
         );
         assert_eq!(
             format_progress(&Progress::ScanStarted { total: 10 }),

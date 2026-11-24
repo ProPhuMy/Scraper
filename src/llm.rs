@@ -10,10 +10,241 @@ use crate::model::{
 use crate::portals::USER_AGENT;
 use crate::text::truncate_chars;
 
+#[derive(Debug, Clone)]
+pub struct PacingState {
+    pub requests_per_minute: u32,
+    pub last_request_at: Option<std::time::Instant>,
+    pub remaining_tokens: Option<u64>,
+    pub reset_tokens: Option<Duration>,
+    pub remaining_requests: Option<u64>,
+    pub reset_requests: Option<Duration>,
+    pub last_total_tokens: u64,
+}
+
+impl Default for PacingState {
+    fn default() -> Self {
+        Self {
+            requests_per_minute: 10,
+            last_request_at: None,
+            remaining_tokens: None,
+            reset_tokens: None,
+            remaining_requests: None,
+            reset_requests: None,
+            last_total_tokens: 2000,
+        }
+    }
+}
+
+pub fn build_chat_body(cfg: &LlmConfig, sys: &str, user: &str) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": cfg.model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user}
+        ]
+    });
+    if let Some(ref effort) = cfg.reasoning_effort {
+        body["reasoning_effort"] = serde_json::Value::String(effort.clone());
+    }
+    body
+}
+
+static DURATION_FULL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"^(\d+(?:\.\d+)?(ms|h|m|s))+$").expect("valid regex")
+});
+static DURATION_PART_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(\d+(?:\.\d+)?)(ms|h|m|s)").expect("valid regex")
+});
+
+pub fn parse_duration(s: &str) -> Option<Duration> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || !DURATION_FULL_RE.is_match(trimmed) {
+        return None;
+    }
+
+    let mut total_nanos: u128 = 0;
+    let mut last_rank = 5;
+
+    for caps in DURATION_PART_RE.captures_iter(trimmed) {
+        let val: f64 = caps[1].parse().ok()?;
+        let unit = &caps[2];
+        let (rank, multiplier_nanos) = match unit {
+            "h" => (4, 3600.0 * 1_000_000_000.0),
+            "m" => (3, 60.0 * 1_000_000_000.0),
+            "s" => (2, 1_000_000_000.0),
+            "ms" => (1, 1_000_000.0),
+            _ => return None,
+        };
+        if rank >= last_rank {
+            return None;
+        }
+        last_rank = rank;
+        let nanos = (val * multiplier_nanos).round() as u128;
+        total_nanos = total_nanos.checked_add(nanos)?;
+    }
+
+    let secs = (total_nanos / 1_000_000_000) as u64;
+    let subsec_nanos = (total_nanos % 1_000_000_000) as u32;
+    Some(Duration::new(secs, subsec_nanos))
+}
+
+pub fn pacing_wait(state: &PacingState, now: std::time::Instant) -> Duration {
+    let mut wait = Duration::ZERO;
+
+    // Minimum spacing since previous request
+    let rpm = state.requests_per_minute.max(1);
+    let min_spacing = Duration::from_millis(60_000 / rpm as u64);
+    if let Some(prev) = state.last_request_at {
+        let elapsed = now.saturating_duration_since(prev);
+        let rpm_wait = min_spacing.saturating_sub(elapsed);
+        if rpm_wait > wait {
+            wait = rpm_wait;
+        }
+    }
+
+    // Check remaining tokens
+    let last_total = if state.last_total_tokens == 0 {
+        2000
+    } else {
+        state.last_total_tokens
+    };
+    if let Some(remaining_tokens) = state.remaining_tokens {
+        if remaining_tokens < last_total {
+            if let Some(reset) = state.reset_tokens {
+                let token_wait = reset + Duration::from_millis(200);
+                if token_wait > wait {
+                    wait = token_wait;
+                }
+            }
+        }
+    }
+
+    // Check remaining requests
+    if let Some(remaining_requests) = state.remaining_requests {
+        if remaining_requests == 0 {
+            if let Some(reset) = state.reset_requests {
+                let req_wait = reset + Duration::from_millis(200);
+                if req_wait > wait {
+                    wait = req_wait;
+                }
+            }
+        }
+    }
+
+    wait
+}
+
+pub fn per_minute_retry_wait(retry_after: Option<&str>, body: &str) -> Duration {
+    // 1. check retry-after header (seconds)
+    if let Some(val) = retry_after {
+        let trimmed = val.trim();
+        if let Ok(secs) = trimmed.parse::<u64>() {
+            return Duration::from_secs(secs).min(Duration::from_secs(120));
+        } else if let Some(dur) = parse_duration(trimmed) {
+            return dur.min(Duration::from_secs(120));
+        }
+    }
+
+    // 2. parse "Please try again in <duration>" from body
+    if let Some(idx) = body.find("Please try again in ") {
+        let rest = &body[idx + "Please try again in ".len()..];
+        if let Some(caps) = DURATION_PART_RE.find(rest) {
+            let mut end = caps.end();
+            while let Some(next_caps) = DURATION_PART_RE.find(&rest[end..]) {
+                if next_caps.start() == 0 {
+                    end += next_caps.end();
+                } else {
+                    break;
+                }
+            }
+            if let Some(dur) = parse_duration(&rest[..end]) {
+                return dur.min(Duration::from_secs(120));
+            }
+        }
+    }
+
+    // 3. fallback 60s
+    Duration::from_secs(60)
+}
+
+static EXP_BLOCKING_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(internship|internships|work experience|industry|professional|employment|years?)\b")
+        .expect("valid regex")
+});
+
+static OPT_BLOCKING_WORD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bopt\b").expect("valid regex")
+});
+
+static CLASS_YEARS_BLOCKING_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(graduat\w*|class of|freshm\w*|sophomores?|juniors?|seniors?|first-year|second-year|third-year|fourth-year|20\d\d)\b")
+        .expect("valid regex")
+});
+
+pub fn blocking_evidence_ok(fact: &str, value: &str, evidence: &str) -> bool {
+    let norm = crate::text::normalize(evidence);
+    match fact {
+        "experience" => {
+            if value == "required" {
+                EXP_BLOCKING_RE.is_match(&norm)
+            } else {
+                true
+            }
+        }
+        "citizenship" => {
+            if value == "required" {
+                norm.contains("citizen")
+                    || norm.contains("clearance")
+                    || norm.contains("us person")
+                    || norm.contains("u.s. person")
+                    || norm.contains("permanent resident")
+                    || norm.contains("green card")
+                    || norm.contains("itar")
+                    || norm.contains("export")
+            } else {
+                true
+            }
+        }
+        "sponsorship" => {
+            if value == "not_offered" {
+                // "visa" / "work authorization" alone are NOT enough: "if an international student,
+                // must already have a work or study visa" welcomes F-1 students (real false "no").
+                norm.contains("sponsor")
+                    || norm.contains("cpt")
+                    || OPT_BLOCKING_WORD_RE.is_match(&norm)
+                    || norm.contains("citizen")
+                    || norm.contains("permanent resident")
+                    || norm.contains("green card")
+                    || norm.contains("for any employer")
+            } else {
+                true
+            }
+        }
+        "gpa" => {
+            if value == "min" || value.parse::<f64>().is_ok() {
+                norm.contains("gpa") || norm.contains("grade point")
+            } else {
+                true
+            }
+        }
+        "class_years" => {
+            if value != "any" && value != "not_mentioned" && value != "unknown" {
+                CLASS_YEARS_BLOCKING_RE.is_match(&norm)
+            } else {
+                true
+            }
+        }
+        _ => true,
+    }
+}
+
 pub struct LlmClient {
     client: reqwest::Client,
     cfg: LlmConfig,
     api_key: String,
+    pacing: std::sync::Mutex<PacingState>,
 }
 
 impl std::fmt::Debug for LlmClient {
@@ -50,10 +281,20 @@ impl LlmClient {
             .user_agent(USER_AGENT)
             .timeout(Duration::from_secs(60))
             .build()?;
+        let pacing = PacingState {
+            requests_per_minute: cfg.requests_per_minute,
+            last_request_at: None,
+            remaining_tokens: None,
+            reset_tokens: None,
+            remaining_requests: None,
+            reset_requests: None,
+            last_total_tokens: 2000,
+        };
         Ok(LlmClient {
             client,
             cfg: cfg.clone(),
             api_key: key,
+            pacing: std::sync::Mutex::new(pacing),
         })
     }
 
@@ -66,23 +307,27 @@ impl LlmClient {
     ) -> anyhow::Result<LlmOutcome> {
         let (sys, user) = build_messages(title, page, facts, season_year);
         let url = format!("{}/chat/completions", self.cfg.base_url.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": self.cfg.model,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": sys},
-                {"role": "user", "content": user}
-            ]
-        });
-
-        let rpm = self.cfg.requests_per_minute.max(1);
-        let pacing_ms = 60_000 / rpm as u64;
+        let body = build_chat_body(&self.cfg, &sys, &user);
 
         let mut attempt = 0;
         loop {
             attempt += 1;
-            tokio::time::sleep(Duration::from_millis(pacing_ms)).await;
+            let wait = {
+                let state = self.pacing.lock().unwrap_or_else(|e| e.into_inner());
+                pacing_wait(&state, std::time::Instant::now())
+            };
+            if !wait.is_zero() {
+                tokio::time::sleep(wait).await;
+            }
+
+            {
+                let mut state = self.pacing.lock().unwrap_or_else(|e| e.into_inner());
+                state.last_request_at = Some(std::time::Instant::now());
+                state.remaining_tokens = None;
+                state.reset_tokens = None;
+                state.remaining_requests = None;
+                state.reset_requests = None;
+            }
 
             let req = self
                 .client
@@ -93,7 +338,29 @@ impl LlmClient {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
+                    let headers = resp.headers().clone();
                     let text = resp.text().await.unwrap_or_default();
+
+                    // Read rate limit headers after every response (success or 429)
+                    {
+                        let mut state = self.pacing.lock().unwrap_or_else(|e| e.into_inner());
+                        state.remaining_tokens = headers
+                            .get("x-ratelimit-remaining-tokens")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok());
+                        state.reset_tokens = headers
+                            .get("x-ratelimit-reset-tokens")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok().map(Duration::from_secs).or_else(|| parse_duration(s)));
+                        state.remaining_requests = headers
+                            .get("x-ratelimit-remaining-requests")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok());
+                        state.reset_requests = headers
+                            .get("x-ratelimit-reset-requests")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok().map(Duration::from_secs).or_else(|| parse_duration(s)));
+                    }
 
                     if status == reqwest::StatusCode::UNAUTHORIZED
                         || status == reqwest::StatusCode::FORBIDDEN
@@ -105,8 +372,12 @@ impl LlmClient {
                         match classify_429(&text) {
                             RateLimit::Daily(d) => return Ok(LlmOutcome::QuotaExhausted(d)),
                             RateLimit::PerMinute => {
-                                if attempt <= 2 {
-                                    tokio::time::sleep(Duration::from_secs(60)).await;
+                                if attempt <= 3 {
+                                    let retry_after = headers
+                                        .get(reqwest::header::RETRY_AFTER)
+                                        .and_then(|v| v.to_str().ok());
+                                    let retry_wait = per_minute_retry_wait(retry_after, &text);
+                                    tokio::time::sleep(retry_wait).await;
                                     continue;
                                 } else {
                                     anyhow::bail!("HTTP 429 after retry: {text}");
@@ -129,6 +400,17 @@ impl LlmClient {
                     }
 
                     let val: serde_json::Value = serde_json::from_str(&text)?;
+
+                    // Remember usage.total_tokens of last successful response
+                    if let Some(total_tokens) = val
+                        .get("usage")
+                        .and_then(|u| u.get("total_tokens"))
+                        .and_then(|t| t.as_u64())
+                    {
+                        let mut state = self.pacing.lock().unwrap_or_else(|e| e.into_inner());
+                        state.last_total_tokens = total_tokens;
+                    }
+
                     let content = val
                         .get("choices")
                         .and_then(|c| c.get(0))
@@ -473,13 +755,20 @@ pub fn parse_answer(
 
                 if let Some(years) = years {
                     if let Some(ev) = get_valid_evidence(val_entry, title, page) {
-                        result.class_years = Fact {
-                            value: ClassYears::Grad(years),
-                            evidence: Some(Evidence {
-                                source: Source::Llm,
-                                snippet: truncate_chars(&ev, 200),
-                            }),
-                        };
+                        if blocking_evidence_ok("class_years", "grad", &ev) {
+                            result.class_years = Fact {
+                                value: ClassYears::Grad(years),
+                                evidence: Some(Evidence {
+                                    source: Source::Llm,
+                                    snippet: truncate_chars(&ev, 200),
+                                }),
+                            };
+                        } else {
+                            result.class_years = Fact {
+                                value: ClassYears::Unknown,
+                                evidence: None,
+                            };
+                        }
                     } else {
                         result.class_years = Fact {
                             value: ClassYears::Unknown,
@@ -548,13 +837,20 @@ pub fn parse_answer(
             } else if let Some(num) = v.and_then(|n| n.as_f64()).map(|f| f as f32) {
                 if (1.0..=4.0).contains(&num) {
                     if let Some(ev) = get_valid_evidence(val_entry, title, page) {
-                        result.gpa = Fact {
-                            value: Gpa::Min(num),
-                            evidence: Some(Evidence {
-                                source: Source::Llm,
-                                snippet: truncate_chars(&ev, 200),
-                            }),
-                        };
+                        if blocking_evidence_ok("gpa", &num.to_string(), &ev) {
+                            result.gpa = Fact {
+                                value: Gpa::Min(num),
+                                evidence: Some(Evidence {
+                                    source: Source::Llm,
+                                    snippet: truncate_chars(&ev, 200),
+                                }),
+                            };
+                        } else {
+                            result.gpa = Fact {
+                                value: Gpa::Unknown,
+                                evidence: None,
+                            };
+                        }
                     } else {
                         result.gpa = Fact {
                             value: Gpa::Unknown,
@@ -593,13 +889,20 @@ pub fn parse_answer(
                 }
                 Some("not_offered") => {
                     if let Some(ev) = get_valid_evidence(val_entry, title, page) {
-                        result.sponsorship = Fact {
-                            value: Sponsorship::NotOffered,
-                            evidence: Some(Evidence {
-                                source: Source::Llm,
-                                snippet: truncate_chars(&ev, 200),
-                            }),
-                        };
+                        if blocking_evidence_ok("sponsorship", "not_offered", &ev) {
+                            result.sponsorship = Fact {
+                                value: Sponsorship::NotOffered,
+                                evidence: Some(Evidence {
+                                    source: Source::Llm,
+                                    snippet: truncate_chars(&ev, 200),
+                                }),
+                            };
+                        } else {
+                            result.sponsorship = Fact {
+                                value: Sponsorship::Unknown,
+                                evidence: None,
+                            };
+                        }
                     } else {
                         result.sponsorship = Fact {
                             value: Sponsorship::Unknown,
@@ -682,13 +985,20 @@ pub fn parse_answer(
                 }
                 Some("required") => {
                     if let Some(ev) = get_valid_evidence(val_entry, title, page) {
-                        result.citizenship = Fact {
-                            value: Citizenship::Required,
-                            evidence: Some(Evidence {
-                                source: Source::Llm,
-                                snippet: truncate_chars(&ev, 200),
-                            }),
-                        };
+                        if blocking_evidence_ok("citizenship", "required", &ev) {
+                            result.citizenship = Fact {
+                                value: Citizenship::Required,
+                                evidence: Some(Evidence {
+                                    source: Source::Llm,
+                                    snippet: truncate_chars(&ev, 200),
+                                }),
+                            };
+                        } else {
+                            result.citizenship = Fact {
+                                value: Citizenship::Unknown,
+                                evidence: None,
+                            };
+                        }
                     } else {
                         result.citizenship = Fact {
                             value: Citizenship::Unknown,
@@ -739,13 +1049,20 @@ pub fn parse_answer(
                 }
                 Some("required") => {
                     if let Some(ev) = get_valid_evidence(val_entry, title, page) {
-                        result.experience = Fact {
-                            value: Experience::Required,
-                            evidence: Some(Evidence {
-                                source: Source::Llm,
-                                snippet: truncate_chars(&ev, 200),
-                            }),
-                        };
+                        if blocking_evidence_ok("experience", "required", &ev) {
+                            result.experience = Fact {
+                                value: Experience::Required,
+                                evidence: Some(Evidence {
+                                    source: Source::Llm,
+                                    snippet: truncate_chars(&ev, 200),
+                                }),
+                            };
+                        } else {
+                            result.experience = Fact {
+                                value: Experience::Unknown,
+                                evidence: None,
+                            };
+                        }
                     } else {
                         result.experience = Fact {
                             value: Experience::Unknown,
@@ -1265,6 +1582,7 @@ mod tests {
             api_key_env: "DEFINITELY_NON_EXISTENT_VAR_XYZ_12345".into(),
             requests_per_minute: 10,
             max_age_days: 30,
+            reasoning_effort: None,
         };
         let err = LlmClient::from_config(&cfg).unwrap_err().to_string();
         assert!(err.contains("DEFINITELY_NON_EXISTENT_VAR_XYZ_12345"));
@@ -1282,5 +1600,209 @@ mod tests {
     #[ignore]
     fn live_llm() {
         // needs LLM_API_KEY + a real [llm] config; settle on gh_sevenresearch page -> Facts
+    }
+
+    #[test]
+    fn test_parse_duration_table() {
+        assert_eq!(parse_duration("1.567s"), Some(Duration::from_millis(1567)));
+        assert_eq!(parse_duration("7.5s"), Some(Duration::from_millis(7500)));
+        assert_eq!(parse_duration("12ms"), Some(Duration::from_millis(12)));
+        assert_eq!(parse_duration("6m22.5s"), Some(Duration::from_millis(382_500)));
+        assert_eq!(parse_duration("6h12m"), Some(Duration::from_secs(22320)));
+        assert_eq!(parse_duration("1h2m3.5s"), Some(Duration::from_millis(3_723_500)));
+        assert_eq!(parse_duration("40313s"), Some(Duration::from_secs(40313)));
+        assert_eq!(parse_duration("0s"), Some(Duration::ZERO));
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("garbage"), None);
+        assert_eq!(parse_duration("12m5"), None);
+    }
+
+    #[test]
+    fn test_pacing_wait_decisions() {
+        let now = std::time::Instant::now();
+
+        // 1. rpm spacing
+        let state_rpm = PacingState {
+            requests_per_minute: 30,
+            last_request_at: Some(now),
+            remaining_tokens: None,
+            reset_tokens: None,
+            remaining_requests: None,
+            reset_requests: None,
+            last_total_tokens: 2000,
+        };
+        assert_eq!(pacing_wait(&state_rpm, now), Duration::from_millis(2000));
+
+        // 2. low remaining tokens -> waits reset (+200ms)
+        let state_tokens = PacingState {
+            requests_per_minute: 30,
+            last_request_at: Some(now),
+            remaining_tokens: Some(500),
+            reset_tokens: Some(Duration::from_secs(5)),
+            remaining_requests: None,
+            reset_requests: None,
+            last_total_tokens: 2000,
+        };
+        assert_eq!(pacing_wait(&state_tokens, now), Duration::from_millis(5200));
+
+        // 3. remaining_requests 0 -> waits reset_requests (+200ms)
+        let state_reqs = PacingState {
+            requests_per_minute: 30,
+            last_request_at: Some(now),
+            remaining_tokens: None,
+            reset_tokens: None,
+            remaining_requests: Some(0),
+            reset_requests: Some(Duration::from_secs(3)),
+            last_total_tokens: 2000,
+        };
+        assert_eq!(pacing_wait(&state_reqs, now), Duration::from_millis(3200));
+
+        // 4. nothing known -> only rpm spacing
+        let state_none = PacingState {
+            requests_per_minute: 30,
+            last_request_at: Some(now),
+            remaining_tokens: None,
+            reset_tokens: None,
+            remaining_requests: None,
+            reset_requests: None,
+            last_total_tokens: 2000,
+        };
+        assert_eq!(pacing_wait(&state_none, now), Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn test_build_chat_body_reasoning_effort() {
+        let mut cfg = LlmConfig {
+            base_url: "https://example.com/v1".into(),
+            model: "openai/gpt-oss-120b".into(),
+            api_key_env: "LLM_API_KEY".into(),
+            requests_per_minute: 30,
+            max_age_days: 30,
+            reasoning_effort: None,
+        };
+        let body_none = build_chat_body(&cfg, "sys", "user");
+        assert!(body_none.get("reasoning_effort").is_none());
+
+        cfg.reasoning_effort = Some("low".into());
+        let body_some = build_chat_body(&cfg, "sys", "user");
+        assert_eq!(body_some.get("reasoning_effort").and_then(|v| v.as_str()), Some("low"));
+    }
+
+    #[test]
+    fn test_per_minute_retry_wait_cases() {
+        assert_eq!(per_minute_retry_wait(Some("7"), ""), Duration::from_secs(7));
+        assert_eq!(per_minute_retry_wait(None, "Please try again in 7.5s"), Duration::from_millis(7500));
+        assert_eq!(per_minute_retry_wait(None, ""), Duration::from_secs(60));
+        assert_eq!(per_minute_retry_wait(None, "Please try again in 6h12m"), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_blocking_evidence_cases() {
+        // experience required
+        let excel_ev = "This position requires advanced Microsoft Excel skills and prior experience using programming or statistical languages (SQL or Python preferred).";
+        assert!(!blocking_evidence_ok("experience", "required", excel_ev));
+        assert!(blocking_evidence_ok("experience", "required", "Prior internship experience is required."));
+        assert!(blocking_evidence_ok("experience", "preferred", excel_ev));
+
+        // citizenship required
+        assert!(blocking_evidence_ok("citizenship", "required", "must be a \"U.S. Person\" ... includes U.S. citizens"));
+        assert!(!blocking_evidence_ok("citizenship", "required", "United States"));
+        assert!(blocking_evidence_ok("citizenship", "not_mentioned", "United States"));
+
+        // sponsorship not_offered
+        assert!(blocking_evidence_ok("sponsorship", "not_offered", "Must be legally authorized to work in the United States for any employer without sponsorship"));
+        assert!(!blocking_evidence_ok("sponsorship", "not_offered", "We are a great team"));
+
+        // class_years [2028]
+        let undergrad_ev = "We will only accept applications from current undergraduate students.";
+        assert!(!blocking_evidence_ok("class_years", "[2028]", undergrad_ev));
+        assert!(blocking_evidence_ok("class_years", "[2028]", "Class of 2028 only"));
+        assert!(blocking_evidence_ok("class_years", "any", undergrad_ev));
+    }
+
+    #[test]
+    fn sponsorship_visa_alone_is_not_a_refusal() {
+        // REAL false "no" from Groq: this welcomes F-1 students who already hold a study visa
+        let compassion = "Legally eligible for employment in the United States (i.e., if an international student, must already have a work or study visa, SSN, etc.)";
+        assert!(!blocking_evidence_ok("sponsorship", "not_offered", compassion));
+        assert!(blocking_evidence_ok("sponsorship", "not_offered", "Must be legally authorized to work in the United States for any employer without sponsorship"));
+        assert!(blocking_evidence_ok("sponsorship", "not_offered", "CPT/OPT candidates are not eligible."));
+        assert!(blocking_evidence_ok("sponsorship", "not_offered", "Open only to U.S. citizens and green card holders."));
+    }
+
+    #[test]
+    fn test_parse_answer_blocking_evidence_rules() {
+        // REAL case: experience "required" with Excel evidence -> stays Unknown
+        let excel_desc = "This position requires advanced Microsoft Excel skills and prior experience using programming or statistical languages (SQL or Python preferred).";
+        let page_excel = PortalPage {
+            description: excel_desc.into(),
+            questions: vec![],
+        };
+        let ans_excel = format!(
+            r#"{{"experience": {{"value": "required", "evidence": "{}"}}}}"#,
+            excel_desc
+        );
+        let f_excel = parse_answer(&ans_excel, &Facts::unknown(), "Analyst Intern", &page_excel).unwrap();
+        assert_eq!(f_excel.experience.value, Experience::Unknown);
+        assert!(f_excel.experience.evidence.is_none());
+
+        // experience "required" with internship evidence -> accepted
+        let intern_desc = "Prior internship experience is required.";
+        let page_intern = PortalPage {
+            description: intern_desc.into(),
+            questions: vec![],
+        };
+        let ans_intern = format!(
+            r#"{{"experience": {{"value": "required", "evidence": "{}"}}}}"#,
+            intern_desc
+        );
+        let f_intern = parse_answer(&ans_intern, &Facts::unknown(), "Analyst Intern", &page_intern).unwrap();
+        assert_eq!(f_intern.experience.value, Experience::Required);
+
+        // citizenship "required" with "must be a \"U.S. Person\" ... includes U.S. citizens" -> accepted
+        let cit_desc = "must be a \"U.S. Person\" which includes U.S. citizens and permanent residents.";
+        let page_cit = PortalPage {
+            description: cit_desc.into(),
+            questions: vec![],
+        };
+        let ans_cit = r#"{"citizenship": {"value": "required", "evidence": "must be a \"U.S. Person\" ... includes U.S. citizens"}}"#;
+        let f_cit = parse_answer(ans_cit, &Facts::unknown(), "Analyst Intern", &page_cit).unwrap();
+        assert_eq!(f_cit.citizenship.value, Citizenship::Required);
+
+        // citizenship "required" with "United States" -> rejected
+        let us_desc = "Located in the United States.";
+        let page_us = PortalPage {
+            description: us_desc.into(),
+            questions: vec![],
+        };
+        let ans_us = r#"{"citizenship": {"value": "required", "evidence": "United States"}}"#;
+        let f_us = parse_answer(ans_us, &Facts::unknown(), "Analyst Intern", &page_us).unwrap();
+        assert_eq!(f_us.citizenship.value, Citizenship::Unknown);
+
+        // sponsorship "not_offered" with authorized without sponsorship -> accepted
+        let spon_desc = "Must be legally authorized to work in the United States for any employer without sponsorship.";
+        let page_spon = PortalPage {
+            description: spon_desc.into(),
+            questions: vec![],
+        };
+        let ans_spon = format!(
+            r#"{{"sponsorship": {{"value": "not_offered", "evidence": "{}"}}}}"#,
+            spon_desc
+        );
+        let f_spon = parse_answer(&ans_spon, &Facts::unknown(), "Analyst Intern", &page_spon).unwrap();
+        assert_eq!(f_spon.sponsorship.value, Sponsorship::NotOffered);
+
+        // class_years [2028] with "We will only accept applications from current undergraduate students." -> rejected
+        let cy_desc = "We will only accept applications from current undergraduate students.";
+        let page_cy = PortalPage {
+            description: cy_desc.into(),
+            questions: vec![],
+        };
+        let ans_cy = format!(
+            r#"{{"class_years": {{"value": [2028], "evidence": "{}"}}}}"#,
+            cy_desc
+        );
+        let f_cy = parse_answer(&ans_cy, &Facts::unknown(), "Analyst Intern", &page_cy).unwrap();
+        assert_eq!(f_cy.class_years.value, ClassYears::Unknown);
     }
 }

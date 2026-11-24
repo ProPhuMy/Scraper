@@ -10,7 +10,8 @@ has_prior_internship = false
 # base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 # model = "gemini-2.5-flash"
 # api_key_env = "LLM_API_KEY"
-# requests_per_minute = 10
+# requests_per_minute = 10  # or 30 for Groq (e.g. openai/gpt-oss-120b)
+# reasoning_effort = "low"  # for gpt-oss on Groq; omit for other providers
 # max_age_days = 30
 
 # [scan]

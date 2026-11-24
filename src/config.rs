@@ -63,6 +63,8 @@ pub struct LlmConfig {
     pub requests_per_minute: u32,
     #[serde(default = "default_max_age_days")]
     pub max_age_days: u32,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 fn default_recheck_days() -> u32 {
