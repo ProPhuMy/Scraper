@@ -403,6 +403,8 @@ pub struct Row {
     pub active: bool,
     pub marks: Marks,
     pub is_new: bool,
+    pub locations: Vec<String>,
+    pub asks_location: bool,
 }
 
 pub fn set_marks(conn: &Connection, job_id: i64, marks: Marks) -> anyhow::Result<()> {
@@ -439,7 +441,7 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
 
     let mut stmt = conn.prepare(
         "SELECT id, simplify_id, company, title, url, provider, status, facts, date_posted,
-                active, starred, hidden, applied_at, first_seen
+                active, starred, hidden, applied_at, first_seen, locations, page
          FROM jobs
          WHERE active = 1 OR starred = 1 OR hidden = 1 OR applied_at IS NOT NULL
          ORDER BY date_posted DESC"
@@ -460,6 +462,8 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
         let hidden_int: i64 = row.get(11)?;
         let applied_at: Option<i64> = row.get(12)?;
         let first_seen: Option<i64> = row.get(13)?;
+        let locations_str: Option<String> = row.get(14)?;
+        let page_str: Option<String> = row.get(15)?;
 
         let provider = Provider::parse(&provider_str);
         let status = Status::parse(&status_str);
@@ -479,6 +483,19 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
                 _ => false,
             };
 
+        let locations: Vec<String> = locations_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        let asks_location = match page_str {
+            Some(ref s) => match serde_json::from_str::<PortalPage>(s) {
+                Ok(page) => crate::extract::asks_location_choice(&page.questions, &locations),
+                Err(_) => false,
+            },
+            None => false,
+        };
+
         Ok((
             Job {
                 id,
@@ -494,12 +511,14 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
             active,
             marks,
             is_new,
+            locations,
+            asks_location,
         ))
     })?;
 
     let mut result = Vec::new();
     for r in rows {
-        let (job, status, facts_str, date_posted, active, marks, is_new) = r?;
+        let (job, status, facts_str, date_posted, active, marks, is_new, locations, asks_location) = r?;
         let facts = match facts_str {
             Some(s) => Some(
                 serde_json::from_str::<Facts>(&s)
@@ -515,6 +534,8 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
             active,
             marks,
             is_new,
+            locations,
+            asks_location,
         });
     }
 
@@ -1023,5 +1044,33 @@ mod tests {
         let row_new = rows.iter().find(|r| r.job.simplify_id == "new_1").unwrap();
         assert!(!row_old.is_new);
         assert!(row_new.is_new);
+    }
+
+    #[test]
+    fn row_has_locations_and_flag() {
+        let mut c = open_in_memory().unwrap();
+        let mut job = nj("job_loc", 100);
+        job.locations = vec!["SF".to_string(), "NYC".to_string()];
+        upsert_jobs(&mut c, &[job]).unwrap();
+
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].locations, vec!["SF", "NYC"]);
+        assert!(!rows[0].asks_location);
+
+        let page = PortalPage {
+            description: "Some job description".to_string(),
+            questions: vec![crate::model::FormQuestion {
+                label: "Which office would you prefer to work in?".to_string(),
+                options: vec![],
+            }],
+        };
+        let facts = Facts::unknown();
+        save_page(&c, rows[0].job.id, &page, &facts).unwrap();
+
+        let rows_after = list_jobs(&c).unwrap();
+        assert_eq!(rows_after.len(), 1);
+        assert_eq!(rows_after[0].locations, vec!["SF", "NYC"]);
+        assert!(rows_after[0].asks_location);
     }
 }

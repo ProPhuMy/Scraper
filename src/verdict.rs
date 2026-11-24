@@ -315,6 +315,7 @@ pub struct JsonOutput<'a> {
     pub hidden: bool,
     pub applied_at: Option<i64>,
     pub new: bool,
+    pub locations: &'a [String],
 }
 
 /// Writes to stdout, treating a closed pipe (`scraper list | head`) as success instead of panicking.
@@ -424,6 +425,7 @@ pub fn list(
                 hidden: vr.row.marks.hidden,
                 applied_at: vr.row.marks.applied_at,
                 new: vr.row.is_new,
+                locations: &vr.row.locations,
             })
             .collect();
 
@@ -806,6 +808,8 @@ mod tests {
             active,
             marks,
             is_new,
+            locations: vec![],
+            asks_location: false,
         }
     }
 
@@ -984,6 +988,7 @@ mod tests {
             hidden: view_row.row.marks.hidden,
             applied_at: view_row.row.marks.applied_at,
             new: view_row.row.is_new,
+            locations: &view_row.row.locations,
         })
         .unwrap();
 
@@ -1005,6 +1010,74 @@ mod tests {
         assert_eq!(json_val["hidden"], false);
         assert_eq!(json_val["applied_at"], 12345);
         assert_eq!(json_val["new"], false);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn json_has_locations() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let toml_str = r#"
+            [profile]
+            class_year = 1
+            needs_sponsorship = false
+            has_prior_internship = false
+        "#;
+        let cfg = crate::config::parse(toml_str).unwrap();
+
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("test_json_locations_{}", nanos));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        {
+            let mut conn = db::open(&db_path).unwrap();
+            let nj1 = NewJob {
+                simplify_id: "job1".to_string(),
+                company: "CleanCorp".to_string(),
+                title: "SWE Intern".to_string(),
+                category: "Software".to_string(),
+                url: "https://example.com/job1".to_string(),
+                provider: Provider::Other,
+                locations: vec!["SF".to_string(), "NYC".to_string()],
+                date_posted: 100,
+                date_updated: 100,
+            };
+            db::upsert_jobs(&mut conn, &[nj1]).unwrap();
+        }
+
+        let conn = db::open(&db_path).unwrap();
+        let rows = db::list_jobs(&conn).unwrap();
+        let flags = ListFlags { all: true, ..Default::default() };
+        let selected = select_rows(&rows, flags);
+        let j = judge(selected[0].status, selected[0].facts.as_ref(), &cfg.profile, cfg.season_year);
+        let view_row = crate::views::ViewRow { row: selected[0], judgement: j };
+        let json_val = serde_json::to_value(&JsonOutput {
+            verdict: view_row.judgement.verdict,
+            year_confirmed: view_row.judgement.year_confirmed,
+            company: &view_row.row.job.company,
+            title: &view_row.row.job.title,
+            url: &view_row.row.job.url,
+            reason: &view_row.judgement.reason,
+            status: view_row.row.status,
+            facts: view_row.row.facts.as_ref(),
+            starred: view_row.row.marks.starred,
+            hidden: view_row.row.marks.hidden,
+            applied_at: view_row.row.marks.applied_at,
+            new: view_row.row.is_new,
+            locations: &view_row.row.locations,
+        })
+        .unwrap();
+
+        assert_eq!(
+            json_val.get("locations").and_then(|v| v.as_array()),
+            Some(&vec![serde_json::json!("SF"), serde_json::json!("NYC")])
+        );
+        assert!(json_val.get("company").is_some());
+        assert!(json_val.get("title").is_some());
+        assert!(json_val.get("url").is_some());
+        assert!(json_val.get("verdict").is_some());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
