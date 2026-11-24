@@ -5,7 +5,7 @@ use crate::extract::{ev, Input};
 use crate::model::{Experience, Fact, Source};
 
 static NOT_REQUIRED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bno\s+(?:[\w-]+\s+){0,3}experience\s+(?:is\s+)?(?:required|necessary|needed)\b|\b(?:(?:internship|work|industry|professional|prior|previous|relevant work)\s+)?experience\b.*?\b(?:is\s+)?not\s+(?:required|necessary|needed)\b")
+    Regex::new(r"\bno\s+(?:[\w-]+\s+){0,8}(?:(?:internship|work|industry|professional|prior|previous|relevant work|relevant)\s+)?experience\b(?:\s+[\w-]+){0,3}\s+(?:required|necessary|needed)\b|\b(?:(?:internship|work|industry|professional|prior|previous|relevant work|relevant)\s+)?experience\b.*?\b(?:is\s+)?not\s+(?:required|necessary|needed)\b")
         .expect("valid regex")
 });
 
@@ -14,8 +14,13 @@ static ZERO_YEARS_OF_EXP_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid regex")
 });
 
+static EXP_CAP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(no more than|less than|fewer than|up to|at most|maximum of)\s+\d+(?:\.\d+)?\s+years?\b")
+        .expect("valid regex")
+});
+
 static EXPERIENCE_NOUN_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(internship|work|industry|professional|prior|previous|relevant work)\s+experience\b")
+    Regex::new(r"\b(internship|work|industry|professional|prior|previous|relevant work|relevant)\s+experience\b")
         .expect("valid regex")
 });
 
@@ -49,10 +54,14 @@ static YEARS_OF_EXP_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 pub fn experience(inp: &Input) -> Fact<Experience> {
-    // 1. Not required. no (prior |previous )?experience (required|necessary|needed) or experience is not required -> NotMentioned, with evidence.
-    // Or a years-of-experience phrase whose number or range starts at 0 -> NotMentioned, with evidence.
+    // 1. Not required (checked first).
+    // - "no" followed within up to 8 words by an experience phrase followed within 3 words by required|necessary|needed -> NotMentioned
+    // - <experience noun> ... is not required|is not necessary|not needed -> NotMentioned
+    // - years-of-experience starting at 0 -> NotMentioned
+    // - cap before N years ("no more than", "less than", "fewer than", "up to", "at most", "maximum of") -> NotMentioned
     for sent in &inp.sentences {
-        if NOT_REQUIRED_RE.is_match(sent) || ZERO_YEARS_OF_EXP_RE.is_match(sent) {
+        let is_cap = EXP_CAP_RE.is_match(sent) && sent.contains("experience");
+        if NOT_REQUIRED_RE.is_match(sent) || ZERO_YEARS_OF_EXP_RE.is_match(sent) || is_cap {
             return Fact {
                 value: Experience::NotMentioned,
                 evidence: ev(Source::Description, sent),
@@ -148,6 +157,12 @@ mod tests {
             ("0+ years of professional experience.", NotMentioned),
             ("0 to 1 years of experience preferred.", NotMentioned),
             ("1-3 years of industry experience required.", Required),
+            ("* no finance or economics study or work experience required", NotMentioned),
+            ("Must have no more than 2 years of professional experience in a similar role.", NotMentioned),
+            ("Less than 1 year of work experience.", NotMentioned),
+            ("Up to 2 years of industry experience.", NotMentioned),
+            ("At most 1 year of professional experience.", NotMentioned),
+            ("Experience: minimum 1 year of relevant experience required", Required),
         ];
         for (t, want) in cases {
             assert_eq!(experience(&Input::from_text(t)).value, want, "{t}");
