@@ -57,6 +57,8 @@ pub struct App {
     pub searching: bool,
     pub class_year: u8,
     pub selected: usize,
+    /// first visible table line, kept between frames for scroll margin (render only has &App)
+    pub table_offset: std::cell::Cell<usize>,
     pub status_msg: Option<String>,
     pub show_help: bool,
     pub quit: bool,
@@ -81,6 +83,7 @@ impl App {
             searching: false,
             class_year: cfg.profile.class_year,
             selected: 0,
+            table_offset: std::cell::Cell::new(0),
             status_msg: None,
             show_help: false,
             quit: false,
@@ -337,14 +340,16 @@ impl App {
                         match line {
                             Line::Header(g_idx) => {
                                 let key = group_key_from_loc(&groups[g_idx].rows[0]);
-                                if self.expanded.contains(&key) {
-                                    self.expanded.remove(&key);
-                                } else {
+                                let expanding = !self.expanded.contains(&key);
+                                if expanding {
                                     self.expanded.insert(key);
+                                } else {
+                                    self.expanded.remove(&key);
                                 }
                                 self.rebuild_lines();
                                 if let Some(pos) = self.lines.iter().position(|l| matches!(l, Line::Header(g) if *g == g_idx)) {
-                                    self.selected = pos;
+                                    // expanding lands on the first location row, where s/h/a/A/o act
+                                    self.selected = if expanding { pos + 1 } else { pos };
                                 }
                                 self.clamp_selected();
                             }
@@ -378,7 +383,7 @@ impl App {
                             self.expanded.insert(key);
                             self.rebuild_lines();
                             if let Some(pos) = self.lines.iter().position(|l| matches!(l, Line::Header(g) if *g == g_idx)) {
-                                self.selected = pos;
+                                self.selected = pos + 1;
                             }
                             self.clamp_selected();
                         }
@@ -964,13 +969,9 @@ mod tests {
         let mut app = App::new(vec![r1, r2], &cfg);
         assert_eq!(app.lines.len(), 1);
 
-        // Enter on header expands
+        // Enter on header expands and lands on the first location row
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
         assert_eq!(app.lines.len(), 3);
-        assert_eq!(app.selected, 0);
-
-        // Select child
-        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
         assert_eq!(app.selected, 1);
 
         // Enter on child collapses parent and moves selection to header
@@ -999,8 +1000,7 @@ mod tests {
         let mut app = App::new(vec![r1, r2, r3], &cfg);
         // Expand group
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        // Move to first child (SF, which has 2 postings: id 2 and 1)
-        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        // Expanding already selected the first child (SF, which has 2 postings: id 2 and 1)
         let action = app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()));
         assert_eq!(
             action,
@@ -1034,8 +1034,7 @@ mod tests {
         // Expand
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
         assert_eq!(app.lines.len(), 3);
-        // Select child 1 (index 1)
-        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        // Expanding selected child 1 (index 1)
         assert_eq!(app.selected, 1);
         // Hide it
         let action = app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()));
@@ -1055,8 +1054,7 @@ mod tests {
         let mut app = App::new(vec![r1, r2, r3], &cfg);
         // Expand
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        // Select child (SF, newest is id 2)
-        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        // Expanding selected the first child (SF, newest is id 2)
         let action = app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
         assert_eq!(action, vec![Action::OpenUrl("https://example.com/job/2".into())]);
     }

@@ -164,6 +164,22 @@ fn format_mark_cell(starred: bool, applied: bool, is_new: bool, closed: bool) ->
     Line::from(spans)
 }
 
+/// Vim-style scrolloff: keep up to 5 rows visible above and below the cursor,
+/// moving the view only when the cursor gets that close to an edge.
+pub fn scroll_offset(prev: usize, selected: usize, visible: usize, total: usize) -> usize {
+    if visible == 0 {
+        return 0;
+    }
+    let pad = 5.min(visible.saturating_sub(1) / 2);
+    let mut offset = prev;
+    if selected < offset + pad {
+        offset = selected.saturating_sub(pad);
+    } else if selected + pad >= offset + visible {
+        offset = selected + pad + 1 - visible;
+    }
+    offset.min(total.saturating_sub(visible))
+}
+
 fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine]) {
     let header_cells = ["MARK", "VERDICT", "YEAR", "COMPANY", "TITLE", "REASON"]
         .into_iter()
@@ -307,10 +323,15 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)))
-        .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        // explicit fg: row spans use DarkGray text, which vanished on the DarkGray highlight bar
+        .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
-    let mut state = TableState::default().with_selected(Some(app.selected));
+    // borders (2) + header row (1)
+    let visible = area.height.saturating_sub(3) as usize;
+    let offset = scroll_offset(app.table_offset.get(), app.selected, visible, lines.len());
+    app.table_offset.set(offset);
+    let mut state = TableState::default().with_offset(offset).with_selected(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -653,6 +674,26 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
 
     let paragraph = Paragraph::new(text).block(block);
     frame.render_widget(paragraph, popup_area);
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::scroll_offset;
+    #[test]
+    fn scroll_keeps_margin() {
+        // 20 visible rows, 100 lines: moving down from the top scrolls once the cursor is 5 from the bottom
+        assert_eq!(scroll_offset(0, 14, 20, 100), 0);
+        assert_eq!(scroll_offset(0, 15, 20, 100), 1);
+        assert_eq!(scroll_offset(1, 16, 20, 100), 2);
+        // moving back up keeps 5 rows above
+        assert_eq!(scroll_offset(30, 34, 20, 100), 29);
+        assert_eq!(scroll_offset(30, 40, 20, 100), 30);
+        // edges: top and bottom of the list are reachable, offset never past the end
+        assert_eq!(scroll_offset(0, 0, 20, 100), 0);
+        assert_eq!(scroll_offset(80, 99, 20, 100), 80);
+        assert_eq!(scroll_offset(0, 3, 20, 5), 0);
+        assert_eq!(scroll_offset(0, 3, 0, 5), 0);
+    }
 }
 
 #[cfg(test)]
