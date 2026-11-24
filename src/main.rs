@@ -7,6 +7,7 @@ mod text;
 mod simplify;
 mod portals;
 mod verdict;
+mod views;
 mod llm;
 
 use std::path::PathBuf;
