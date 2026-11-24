@@ -16,6 +16,9 @@ pub enum Action {
     Refresh,
 }
 
+/// Shown when Enter is pressed on a row that isn't an expandable ×N group, so the key never fails silently.
+pub const ENTER_HINT: &str = "Enter expands ×N groups · o opens the job · A opens + marks applied";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Line {
     Plain(usize),
@@ -354,9 +357,13 @@ impl App {
                                 }
                                 self.clamp_selected();
                             }
-                            Line::Plain(_) => {}
+                            Line::Plain(_) => {
+                                self.status_msg = Some(ENTER_HINT.to_string());
+                            }
                         }
                     }
+                } else {
+                    self.status_msg = Some(ENTER_HINT.to_string());
                 }
                 Vec::new()
             }
@@ -901,6 +908,15 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
         assert_eq!(app.search, "neu");
         assert!(!app.searching);
+    }
+
+    #[test]
+    fn enter_on_plain_row_shows_hint() {
+        let r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(app.status_msg.as_deref(), Some(ENTER_HINT));
     }
 
     #[test]
