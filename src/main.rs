@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod model;
 mod text;
+mod simplify;
 
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
