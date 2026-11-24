@@ -133,7 +133,7 @@ impl LlmClient {
                             )
                         })?;
 
-                    let settled = parse_answer(content, facts)?;
+                    let settled = parse_answer(content, facts, title, page)?;
                     return Ok(LlmOutcome::Facts(settled));
                 }
                 Err(e) => {
@@ -154,7 +154,7 @@ You classify internship eligibility facts from a job posting. Answer ONLY with a
 Use ONLY the facts listed in the user message. For each, return {\"value\": ..., \"evidence\": \"<exact quote from the posting, max 200 chars>\"}.
 If the posting does not settle a fact, return \"unknown\" for it. Never guess.
 Allowed values:
-- class_years: \"any\", \"unknown\", or an array of accepted graduation years (integers). The internship is in summer {S}. A current freshman graduates {S+3}, sophomore {S+2}, junior {S+1}.
+- class_years: an array of accepted graduation years (integers) ONLY if the posting names graduation years, \"class of\" years, or class standings (freshman/sophomore/junior/senior, first-year, rising ...). The internship is in summer {S}. A current freshman graduates {S+3}, sophomore {S+2}, junior {S+1}. \"Current students\", \"enrolled in a degree program\" or \"undergraduates\" alone means \"any\". Else \"unknown\".
 - gpa: a number (the required minimum), \"asked\", \"not_mentioned\", or \"unknown\".
 - sponsorship: \"not_offered\" ONLY if the posting refuses CPT/OPT, is limited to US citizens/permanent residents, or requires no sponsorship now or in the future. Plain \"we do not sponsor visas\" or a question asking about sponsorship is \"asked\". \"offered\" if sponsorship or CPT/OPT is explicitly welcome. Else \"not_mentioned\" or \"unknown\".
 - citizenship: \"required\" if US citizenship, US person status, or a security clearance is required or asked for. Else \"not_mentioned\" or \"unknown\". Ignore equal-opportunity boilerplate and \"authorized to work in the US\" questions.
@@ -221,7 +221,87 @@ fn get_evidence(fact_val: &serde_json::Map<String, serde_json::Value>) -> Option
         .filter(|s| !s.is_empty())
 }
 
-pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
+pub fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn evidence_in_posting(evidence: &str, title: &str, page: &PortalPage) -> bool {
+    let mut raw = String::new();
+    raw.push_str(title);
+    raw.push('\n');
+    raw.push_str(&page.description);
+    raw.push('\n');
+    for q in &page.questions {
+        raw.push_str(&q.label);
+        raw.push('\n');
+        for opt in &q.options {
+            raw.push_str(opt);
+            raw.push('\n');
+        }
+    }
+    let haystack = collapse_whitespace(&crate::text::normalize(&raw));
+
+    let norm_ev = collapse_whitespace(&crate::text::normalize(evidence));
+    let mut needle = norm_ev.as_str();
+
+    // Strip surrounding quotes ("'“”‘’) and trailing punctuation (.,;:)
+    loop {
+        let prev = needle;
+        needle = needle.trim_matches(|c| matches!(c, '"' | '\'' | '“' | '”' | '‘' | '’'));
+        needle = needle.trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':'));
+        needle = needle.trim();
+        if needle == prev {
+            break;
+        }
+    }
+
+    // the LLM may shorten quotes with "..." or "…": split the needle on those;
+    // EVERY piece that is at least 8 chars long must appear in the haystack;
+    // pieces shorter than 8 chars are ignored; but if NO piece is at least 8 chars long, return false.
+    let pieces: Vec<&str> = needle
+        .split("...")
+        .flat_map(|p| p.split('…'))
+        .map(|p| {
+            p.trim()
+                .trim_matches(|c| matches!(c, '"' | '\'' | '“' | '”' | '‘' | '’'))
+                .trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':'))
+                .trim()
+        })
+        .collect();
+
+    let mut has_long_piece = false;
+    for piece in pieces {
+        if piece.chars().count() < 8 {
+            continue;
+        }
+        has_long_piece = true;
+        if !haystack.contains(piece) {
+            return false;
+        }
+    }
+
+    has_long_piece
+}
+
+fn get_valid_evidence(
+    fact_val: &serde_json::Map<String, serde_json::Value>,
+    title: &str,
+    page: &PortalPage,
+) -> Option<String> {
+    let ev = get_evidence(fact_val)?;
+    if evidence_in_posting(&ev, title, page) {
+        Some(ev)
+    } else {
+        None
+    }
+}
+
+pub fn parse_answer(
+    content: &str,
+    current: &Facts,
+    title: &str,
+    page: &PortalPage,
+) -> anyhow::Result<Facts> {
     let cleaned = strip_code_fences(content);
     let parsed: serde_json::Value = serde_json::from_str(cleaned)?;
     let obj = parsed
@@ -240,7 +320,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     evidence: None,
                 };
             } else if v == Some(&serde_json::Value::String("any".to_string())) {
-                if let Some(ev) = get_evidence(val_entry) {
+                if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                     result.class_years = Fact {
                         value: ClassYears::Any,
                         evidence: Some(Evidence {
@@ -281,7 +361,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                 };
 
                 if let Some(years) = years {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.class_years = Fact {
                             value: ClassYears::Grad(years),
                             evidence: Some(Evidence {
@@ -325,7 +405,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     evidence: None,
                 };
             } else if v == Some(&serde_json::Value::String("asked".to_string())) {
-                if let Some(ev) = get_evidence(val_entry) {
+                if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                     result.gpa = Fact {
                         value: Gpa::Asked,
                         evidence: Some(Evidence {
@@ -340,7 +420,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     };
                 }
             } else if v == Some(&serde_json::Value::String("not_mentioned".to_string())) {
-                if let Some(ev) = get_evidence(val_entry) {
+                if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                     result.gpa = Fact {
                         value: Gpa::NotMentioned,
                         evidence: Some(Evidence {
@@ -356,7 +436,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                 }
             } else if let Some(num) = v.and_then(|n| n.as_f64()).map(|f| f as f32) {
                 if (1.0..=4.0).contains(&num) {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.gpa = Fact {
                             value: Gpa::Min(num),
                             evidence: Some(Evidence {
@@ -401,7 +481,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     };
                 }
                 Some("not_offered") => {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.sponsorship = Fact {
                             value: Sponsorship::NotOffered,
                             evidence: Some(Evidence {
@@ -417,7 +497,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     }
                 }
                 Some("offered") => {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.sponsorship = Fact {
                             value: Sponsorship::Offered,
                             evidence: Some(Evidence {
@@ -433,7 +513,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     }
                 }
                 Some("asked") => {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.sponsorship = Fact {
                             value: Sponsorship::Asked,
                             evidence: Some(Evidence {
@@ -449,7 +529,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     }
                 }
                 Some("not_mentioned") => {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.sponsorship = Fact {
                             value: Sponsorship::NotMentioned,
                             evidence: Some(Evidence {
@@ -490,7 +570,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     };
                 }
                 Some("required") => {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.citizenship = Fact {
                             value: Citizenship::Required,
                             evidence: Some(Evidence {
@@ -506,7 +586,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     }
                 }
                 Some("not_mentioned") => {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.citizenship = Fact {
                             value: Citizenship::NotMentioned,
                             evidence: Some(Evidence {
@@ -547,7 +627,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     };
                 }
                 Some("required") => {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.experience = Fact {
                             value: Experience::Required,
                             evidence: Some(Evidence {
@@ -563,7 +643,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     }
                 }
                 Some("preferred") => {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.experience = Fact {
                             value: Experience::Preferred,
                             evidence: Some(Evidence {
@@ -579,7 +659,7 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
                     }
                 }
                 Some("not_mentioned") => {
-                    if let Some(ev) = get_evidence(val_entry) {
+                    if let Some(ev) = get_valid_evidence(val_entry, title, page) {
                         result.experience = Fact {
                             value: Experience::NotMentioned,
                             evidence: Some(Evidence {
@@ -612,6 +692,72 @@ pub fn parse_answer(content: &str, current: &Facts) -> anyhow::Result<Facts> {
     Ok(result)
 }
 
+pub fn format_class_years(years: &BTreeSet<u16>) -> String {
+    let list: Vec<u16> = years.iter().copied().collect();
+    if list.len() >= 2 && list.windows(2).all(|w| w[1] == w[0] + 1) {
+        format!("{}-{}", list[0], list[list.len() - 1])
+    } else {
+        list.iter().map(|y| y.to_string()).collect::<Vec<_>>().join(", ")
+    }
+}
+
+pub fn fact_changes(before: &Facts, after: &Facts) -> Vec<(String, String)> {
+    let mut changes = Vec::new();
+
+    // 1. class_years
+    if matches!(before.class_years.value, ClassYears::Unknown) {
+        match &after.class_years.value {
+            ClassYears::Any => changes.push(("class_years".to_string(), "any".to_string())),
+            ClassYears::Grad(years) => {
+                changes.push(("class_years".to_string(), format_class_years(years)));
+            }
+            ClassYears::Unknown => {}
+        }
+    }
+
+    // 2. gpa
+    if matches!(before.gpa.value, Gpa::Unknown) {
+        match &after.gpa.value {
+            Gpa::Min(val) => changes.push(("gpa".to_string(), format!("min {val}"))),
+            Gpa::Asked => changes.push(("gpa".to_string(), "asked".to_string())),
+            Gpa::NotMentioned => changes.push(("gpa".to_string(), "not_mentioned".to_string())),
+            Gpa::Unknown => {}
+        }
+    }
+
+    // 3. sponsorship
+    if matches!(before.sponsorship.value, Sponsorship::Unknown) {
+        match &after.sponsorship.value {
+            Sponsorship::Offered => changes.push(("sponsorship".to_string(), "offered".to_string())),
+            Sponsorship::NotOffered => changes.push(("sponsorship".to_string(), "not_offered".to_string())),
+            Sponsorship::Asked => changes.push(("sponsorship".to_string(), "asked".to_string())),
+            Sponsorship::NotMentioned => changes.push(("sponsorship".to_string(), "not_mentioned".to_string())),
+            Sponsorship::Unknown => {}
+        }
+    }
+
+    // 4. citizenship
+    if matches!(before.citizenship.value, Citizenship::Unknown) {
+        match &after.citizenship.value {
+            Citizenship::Required => changes.push(("citizenship".to_string(), "required".to_string())),
+            Citizenship::NotMentioned => changes.push(("citizenship".to_string(), "not_mentioned".to_string())),
+            Citizenship::Unknown => {}
+        }
+    }
+
+    // 5. experience
+    if matches!(before.experience.value, Experience::Unknown) {
+        match &after.experience.value {
+            Experience::Required => changes.push(("experience".to_string(), "required".to_string())),
+            Experience::Preferred => changes.push(("experience".to_string(), "preferred".to_string())),
+            Experience::NotMentioned => changes.push(("experience".to_string(), "not_mentioned".to_string())),
+            Experience::Unknown => {}
+        }
+    }
+
+    changes
+}
+
 pub fn is_quota_error(status: u16, body: &str) -> bool {
     if status != 429 {
         return false;
@@ -637,7 +783,11 @@ mod tests {
  "class_years":{"value":[2029,2030],"evidence":"rising juniors and sophomores"},"citizenship":{"value":"required","evidence":""},
  "experience":{"value":"bogus","evidence":"x"}}
 ```"#;
-        let f = parse_answer(ans, &cur).unwrap();
+        let page = PortalPage {
+            description: "We cannot sponsor H-1B. 3.5 GPA. rising juniors and sophomores.".into(),
+            questions: vec![],
+        };
+        let f = parse_answer(ans, &cur, "SWE Intern", &page).unwrap();
         assert_eq!(f.sponsorship.value, Sponsorship::Asked);
         assert_eq!(
             f.sponsorship.evidence.as_ref().unwrap().source,
@@ -654,7 +804,11 @@ mod tests {
 
     #[test]
     fn non_json_is_err() {
-        assert!(parse_answer("sorry, I can't", &Facts::unknown()).is_err());
+        let page = PortalPage {
+            description: "".into(),
+            questions: vec![],
+        };
+        assert!(parse_answer("sorry, I can't", &Facts::unknown(), "SWE Intern", &page).is_err());
     }
 
     #[test]
@@ -691,6 +845,7 @@ mod tests {
         };
         let (sys, user) = build_messages("SWE Intern", &page, &f, 2027);
         assert!(sys.contains("summer 2027") && sys.contains("graduates 2030"));
+        assert!(sys.contains("Current students") && sys.contains("means \"any\""));
         assert!(user.contains("Facts to settle: class_years, sponsorship, citizenship, experience"));
         assert!(user.contains("- GPA? [options: 3.5+]"));
         assert!(user.contains("- Clearance?\n"));
@@ -706,7 +861,11 @@ mod tests {
             "gpa": {"value": 4.5, "evidence": "4.5 GPA"},
             "experience": {"value": "preferred", "evidence": "Prior experience is a plus."}
         }"#;
-        let f = parse_answer(ans, &cur).unwrap();
+        let page = PortalPage {
+            description: "All class years welcome. 4.5 GPA. Prior experience is a plus.".into(),
+            questions: vec![],
+        };
+        let f = parse_answer(ans, &cur, "SWE Intern", &page).unwrap();
         assert_eq!(f.class_years.value, ClassYears::Any);
         assert_eq!(f.class_years.evidence.as_ref().unwrap().source, Source::Llm);
         assert_eq!(f.gpa.value, Gpa::Unknown); // 4.5 is outside [1.0, 4.0]
@@ -717,9 +876,69 @@ mod tests {
     fn parse_answer_code_fence_without_json_tag() {
         let cur = Facts::unknown();
         let ans = "```\n{\"sponsorship\": {\"value\": \"offered\", \"evidence\": \"Visa sponsorship available.\"}}\n```";
-        let f = parse_answer(ans, &cur).unwrap();
+        let page = PortalPage {
+            description: "Visa sponsorship available.".into(),
+            questions: vec![],
+        };
+        let f = parse_answer(ans, &cur, "SWE Intern", &page).unwrap();
         assert_eq!(f.sponsorship.value, Sponsorship::Offered);
         assert_eq!(f.sponsorship.evidence.as_ref().unwrap().snippet, "Visa sponsorship available.");
+    }
+
+    #[test]
+    fn evidence_in_posting_cases() {
+        let page = PortalPage {
+            description: "We will only accept applications from current undergraduate students. Must have 3.0 GPA or higher.".into(),
+            questions: vec![
+                FormQuestion {
+                    label: "Are you authorized to work in the US?".into(),
+                    options: vec!["Yes".into(), "No".into()],
+                },
+            ],
+        };
+
+        // - "unknown" -> false; "yes" -> false; "" -> false
+        assert!(!evidence_in_posting("unknown", "SWE Intern", &page));
+        assert!(!evidence_in_posting("yes", "SWE Intern", &page));
+        assert!(!evidence_in_posting("", "SWE Intern", &page));
+
+        // - an exact sentence from the description -> true (also with different case/extra spaces/curly quotes)
+        assert!(evidence_in_posting("Must have 3.0 GPA or higher.", "SWE Intern", &page));
+        assert!(evidence_in_posting("  must  HAVE   3.0 gpa or higher.  ", "SWE Intern", &page));
+        assert!(evidence_in_posting("“Must have 3.0 GPA or higher.”", "SWE Intern", &page));
+
+        // - "We will only accept ... current undergraduate students." when description contains "We will only accept applications from current undergraduate students." -> true
+        assert!(evidence_in_posting("We will only accept ... current undergraduate students.", "SWE Intern", &page));
+        assert!(evidence_in_posting("We will only accept … current undergraduate students.", "SWE Intern", &page));
+
+        // - a fabricated sentence not in the posting -> false
+        assert!(!evidence_in_posting("Only accepting applications from class of 2028.", "SWE Intern", &page));
+
+        // - a quote taken from a form question label -> true
+        assert!(evidence_in_posting("Are you authorized to work in the US?", "SWE Intern", &page));
+    }
+
+    #[test]
+    fn parse_answer_amazon_and_decided_with_real_quote() {
+        let cur = Facts::unknown();
+        let page = PortalPage {
+            description: "This is a software development internship. Must be enrolled in a degree program.".into(),
+            questions: vec![],
+        };
+
+        // Amazon case: citizenship {"value":"not_mentioned","evidence":"unknown"} -> stays Unknown
+        let ans_amazon = r#"{"citizenship": {"value": "not_mentioned", "evidence": "unknown"}}"#;
+        let f = parse_answer(ans_amazon, &cur, "SWE Intern", &page).unwrap();
+        assert_eq!(f.citizenship.value, Citizenship::Unknown);
+        assert!(f.citizenship.evidence.is_none());
+
+        // Decided value with real quote -> accepted with Source::Llm
+        let ans_real = r#"{"class_years": {"value": "any", "evidence": "Must be enrolled in a degree program."}}"#;
+        let f2 = parse_answer(ans_real, &cur, "SWE Intern", &page).unwrap();
+        assert_eq!(f2.class_years.value, ClassYears::Any);
+        let ev = f2.class_years.evidence.as_ref().unwrap();
+        assert_eq!(ev.source, Source::Llm);
+        assert_eq!(ev.snippet, "Must be enrolled in a degree program.");
     }
 
     #[test]

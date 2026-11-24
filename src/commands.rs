@@ -49,9 +49,12 @@ pub enum Progress {
     LlmStarted {
         total: usize,
     },
-    LlmDone {
+    LlmSettled {
         done: usize,
         total: usize,
+        company: String,
+        title: String,
+        changes: Vec<(String, String)>,
     },
     LlmSaveError {
         job_id: i64,
@@ -138,7 +141,32 @@ pub fn format_progress(p: &Progress) -> Option<(bool, String)> {
         )),
         Progress::LlmClientError(e) => Some((true, e.clone())),
         Progress::LlmStarted { .. } => None,
-        Progress::LlmDone { .. } => None,
+        Progress::LlmSettled {
+            done,
+            total,
+            company,
+            title,
+            changes,
+        } => {
+            if changes.is_empty() {
+                Some((
+                    false,
+                    format!("[LLM {done}/{total}] {company} \u{2014} {title}: no change"),
+                ))
+            } else {
+                let changes_str = changes
+                    .iter()
+                    .map(|(k, v)| format!("{k} \u{2192} {v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some((
+                    false,
+                    format!(
+                        "[LLM {done}/{total}] {company} \u{2014} {title}: {changes_str}"
+                    ),
+                ))
+            }
+        }
         Progress::LlmSaveError { job_id, error } => Some((
             true,
             format!("failed to save LLM facts for job {job_id}: {error}"),
@@ -443,7 +471,14 @@ pub async fn scan_with(
                     });
                 }
                 done += 1;
-                report(Progress::LlmDone { done, total });
+                let changes = crate::llm::fact_changes(&facts, &f);
+                report(Progress::LlmSettled {
+                    done,
+                    total,
+                    company: job.company,
+                    title: job.title,
+                    changes,
+                });
             }
             Ok(LlmOutcome::QuotaExhausted) => {
                 report(Progress::LlmQuota);
@@ -455,7 +490,13 @@ pub async fn scan_with(
                     error: format!("{e:#}"),
                 });
                 done += 1;
-                report(Progress::LlmDone { done, total });
+                report(Progress::LlmSettled {
+                    done,
+                    total,
+                    company: job.company,
+                    title: job.title,
+                    changes: Vec::new(),
+                });
             }
         }
     }
@@ -598,8 +639,30 @@ mod tests {
             None
         );
         assert_eq!(
-            format_progress(&Progress::LlmDone { done: 1, total: 2 }),
-            None
+            format_progress(&Progress::LlmSettled {
+                done: 3,
+                total: 5,
+                company: "CornerStone Partners".into(),
+                title: "AI and Automation Intern".into(),
+                changes: vec![("class_years".into(), "any".into())],
+            }),
+            Some((
+                false,
+                "[LLM 3/5] CornerStone Partners \u{2014} AI and Automation Intern: class_years \u{2192} any".into()
+            ))
+        );
+        assert_eq!(
+            format_progress(&Progress::LlmSettled {
+                done: 3,
+                total: 5,
+                company: "CornerStone Partners".into(),
+                title: "AI and Automation Intern".into(),
+                changes: vec![],
+            }),
+            Some((
+                false,
+                "[LLM 3/5] CornerStone Partners \u{2014} AI and Automation Intern: no change".into()
+            ))
         );
         assert_eq!(
             format_progress(&Progress::LlmSaveError {

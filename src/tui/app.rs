@@ -639,7 +639,7 @@ impl App {
             Progress::LlmStarted { total } => {
                 self.progress = Some(format!("LLM 0/{total}"));
             }
-            Progress::LlmDone { done, total } => {
+            Progress::LlmSettled { done, total, .. } => {
                 self.progress = Some(format!("LLM {done}/{total}"));
             }
             Progress::LlmQuota => {
@@ -1156,9 +1156,12 @@ mod tests {
         });
         assert_eq!(app.progress.as_deref(), Some("scanning 412/1801"));
 
-        app.on_progress(&crate::commands::Progress::LlmDone {
+        app.on_progress(&crate::commands::Progress::LlmSettled {
             done: 12,
             total: 385,
+            company: "Acme".into(),
+            title: "SWE".into(),
+            changes: vec![],
         });
         assert_eq!(app.progress.as_deref(), Some("LLM 12/385"));
 
