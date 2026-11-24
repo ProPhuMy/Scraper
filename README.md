@@ -10,18 +10,25 @@ Many job postings never say outright whether they take first-years, need a GPA, 
 
 ## Install
 
-Linux, macOS, or Windows (Git Bash):
+**Windows** (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/ProPhuMy/Scraper/main/install.ps1 | iex
+```
+
+**Linux / macOS** (or Git Bash on Windows):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ProPhuMy/Scraper/main/install.sh | sh
 ```
 
-The script picks the right build for your system, checks its SHA-256 checksum, and installs it to `~/.local/bin`. Optional environment variables:
+Both scripts download the right prebuilt binary for your system (no Rust or source code needed). They verify its SHA-256 checksum and install it to `~/.local/bin` (`%USERPROFILE%\.localin` on Windows). The PowerShell installer also adds that folder to your user PATH, so open a new terminal afterwards. Optional environment variables:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SCRAPER_VERSION` | latest release | Install a specific tag, e.g. `v0.1.0` |
+| `SCRAPER_VERSION` | latest release | Install a specific tag, e.g. `v0.2.1` |
 | `SCRAPER_INSTALL_DIR` | `~/.local/bin` | Install somewhere else |
+| `SCRAPER_NO_MODIFY_PATH` | unset | `1` = don't touch PATH (PowerShell installer) |
 
 ## Set up
 
