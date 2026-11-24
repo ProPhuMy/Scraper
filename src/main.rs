@@ -1,5 +1,6 @@
 mod config;
 mod db;
+mod extract;
 mod model;
 mod text;
 mod simplify;
