@@ -59,12 +59,24 @@ pub struct LlmConfig {
     pub requests_per_minute: u32,
 }
 
+fn default_recheck_days() -> u32 {
+    7
+}
+
+fn default_recheck_max() -> usize {
+    200
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct ScanConfig {
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
     #[serde(default = "default_per_host")]
     pub per_host: usize,
+    #[serde(default = "default_recheck_days")]
+    pub recheck_days: u32,
+    #[serde(default = "default_recheck_max")]
+    pub recheck_max: usize,
 }
 
 impl Default for ScanConfig {
@@ -72,6 +84,8 @@ impl Default for ScanConfig {
         Self {
             concurrency: default_concurrency(),
             per_host: default_per_host(),
+            recheck_days: default_recheck_days(),
+            recheck_max: default_recheck_max(),
         }
     }
 }
@@ -179,5 +193,29 @@ mod tests {
             err,
             "scraper.toml not found; copy scraper.example.toml to scraper.toml and edit [profile]"
         );
+    }
+
+    #[test]
+    fn config_recheck_defaults() {
+        let c = parse(include_str!("../scraper.example.toml")).unwrap();
+        assert_eq!(c.scan.recheck_days, 7);
+        assert_eq!(c.scan.recheck_max, 200);
+
+        let toml_str = r#"
+            [profile]
+            class_year = 1
+            needs_sponsorship = false
+            has_prior_internship = false
+
+            [scan]
+            recheck_days = 0
+        "#;
+        let c2 = parse(toml_str).unwrap();
+        assert_eq!(c2.scan.recheck_days, 0);
+        assert_eq!(c2.scan.recheck_max, 200);
+
+        let def = ScanConfig::default();
+        assert_eq!(def.recheck_days, 7);
+        assert_eq!(def.recheck_max, 200);
     }
 }

@@ -387,6 +387,76 @@ pub fn save_llm(conn: &Connection, job_id: i64, facts: &Facts) -> anyhow::Result
     Ok(())
 }
 
+pub fn recheck_jobs(
+    conn: &Connection,
+    recheck_days: u32,
+    max: usize,
+    now: i64,
+) -> anyhow::Result<Vec<Job>> {
+    if recheck_days == 0 || max == 0 {
+        return Ok(Vec::new());
+    }
+    let cutoff = now - (recheck_days as i64) * 86400;
+    let sql = "SELECT id, simplify_id, company, title, url, provider FROM jobs
+               WHERE active = 1
+                 AND status IN ('rules_done', 'llm_done', 'unreadable')
+                 AND scanned_at IS NOT NULL
+                 AND scanned_at < ?1
+               ORDER BY (starred = 1 OR applied_at IS NOT NULL) DESC, scanned_at ASC
+               LIMIT ?2";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![cutoff, max as i64], |row| {
+        let id: i64 = row.get(0)?;
+        let simplify_id: String = row.get(1)?;
+        let company: String = row.get(2)?;
+        let title: String = row.get(3)?;
+        let url: String = row.get(4)?;
+        let provider_str: String = row.get(5)?;
+        let provider = Provider::parse(&provider_str);
+        Ok(Job {
+            id,
+            simplify_id,
+            company,
+            title,
+            url,
+            provider,
+        })
+    })?;
+
+    let mut jobs = Vec::new();
+    for job in rows {
+        jobs.push(job?);
+    }
+    Ok(jobs)
+}
+
+pub fn stored_page(conn: &Connection, job_id: i64) -> anyhow::Result<Option<PortalPage>> {
+    let page_str: Option<String> = conn
+        .query_row(
+            "SELECT page FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match page_str {
+        Some(s) => {
+            let page: PortalPage = serde_json::from_str(&s)
+                .with_context(|| format!("failed to deserialize PortalPage for job id {job_id}"))?;
+            Ok(Some(page))
+        }
+        None => Ok(None),
+    }
+}
+
+pub fn touch_scanned(conn: &Connection, job_id: i64, now: i64) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE jobs SET scanned_at = ?1 WHERE id = ?2",
+        params![now, job_id],
+    )?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub struct Marks {
     pub starred: bool,
@@ -1072,5 +1142,158 @@ mod tests {
         assert_eq!(rows_after.len(), 1);
         assert_eq!(rows_after[0].locations, vec!["SF", "NYC"]);
         assert!(rows_after[0].asks_location);
+    }
+
+    #[test]
+    fn recheck_selects_old_active_scanned() {
+        let mut conn = open_in_memory().unwrap();
+        let now = 1_000_000;
+        let ten_days_ago = now - 10 * 86400;
+        let one_day_ago = now - 1 * 86400;
+
+        let j1 = nj("j1", 100);
+        let j2 = nj("j2", 100);
+        let j3 = nj("j3", 100);
+        let j4 = nj("j4", 100);
+        let j5 = nj("j5", 100);
+        upsert_jobs(&mut conn, &[j1, j2, j3, j4, j5]).unwrap();
+
+        conn.execute(
+            "UPDATE jobs SET status = 'rules_done', scanned_at = ?1, active = 1 WHERE simplify_id = 'j1'",
+            params![ten_days_ago],
+        ).unwrap();
+
+        conn.execute(
+            "UPDATE jobs SET status = 'rules_done', scanned_at = ?1, active = 1 WHERE simplify_id = 'j2'",
+            params![one_day_ago],
+        ).unwrap();
+
+        conn.execute(
+            "UPDATE jobs SET status = 'pending', scanned_at = ?1, active = 1 WHERE simplify_id = 'j3'",
+            params![ten_days_ago],
+        ).unwrap();
+
+        conn.execute(
+            "UPDATE jobs SET status = 'rules_done', scanned_at = ?1, active = 0 WHERE simplify_id = 'j4'",
+            params![ten_days_ago],
+        ).unwrap();
+
+        conn.execute(
+            "UPDATE jobs SET status = 'gone', scanned_at = ?1, active = 1 WHERE simplify_id = 'j5'",
+            params![ten_days_ago],
+        ).unwrap();
+
+        let jobs = recheck_jobs(&conn, 7, 100, now).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].simplify_id, "j1");
+    }
+
+    #[test]
+    fn recheck_orders_marked_first_and_caps() {
+        let mut conn = open_in_memory().unwrap();
+        let now = 1_000_000;
+        let fifteen_days_ago = now - 15 * 86400;
+        let twelve_days_ago = now - 12 * 86400;
+        let eight_days_ago = now - 8 * 86400;
+
+        let j1 = nj("j1", 100);
+        let j2 = nj("j2", 100);
+        let j3 = nj("j3", 100);
+        upsert_jobs(&mut conn, &[j1, j2, j3]).unwrap();
+
+        conn.execute(
+            "UPDATE jobs SET status = 'rules_done', scanned_at = ?1, active = 1, starred = 0 WHERE simplify_id = 'j1'",
+            params![fifteen_days_ago],
+        ).unwrap();
+
+        conn.execute(
+            "UPDATE jobs SET status = 'rules_done', scanned_at = ?1, active = 1, starred = 0 WHERE simplify_id = 'j2'",
+            params![twelve_days_ago],
+        ).unwrap();
+
+        conn.execute(
+            "UPDATE jobs SET status = 'rules_done', scanned_at = ?1, active = 1, starred = 1 WHERE simplify_id = 'j3'",
+            params![eight_days_ago],
+        ).unwrap();
+
+        let jobs = recheck_jobs(&conn, 7, 2, now).unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].simplify_id, "j3");
+        assert_eq!(jobs[1].simplify_id, "j1");
+    }
+
+    #[test]
+    fn recheck_disabled_when_zero_days() {
+        let mut conn = open_in_memory().unwrap();
+        let now = 1_000_000;
+        let ten_days_ago = now - 10 * 86400;
+
+        let j1 = nj("j1", 100);
+        upsert_jobs(&mut conn, &[j1]).unwrap();
+
+        conn.execute(
+            "UPDATE jobs SET status = 'rules_done', scanned_at = ?1, active = 1 WHERE simplify_id = 'j1'",
+            params![ten_days_ago],
+        ).unwrap();
+
+        let jobs = recheck_jobs(&conn, 0, 100, now).unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[test]
+    fn touch_scanned_only_changes_time() {
+        let mut conn = open_in_memory().unwrap();
+        let j1 = nj("j1", 100);
+        upsert_jobs(&mut conn, &[j1]).unwrap();
+
+        let page = PortalPage {
+            description: "original desc".to_string(),
+            questions: vec![],
+        };
+        let facts = Facts::unknown();
+        save_page(&conn, 1, &page, &facts).unwrap();
+
+        let original_status: String = conn.query_row("SELECT status FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let original_page: String = conn.query_row("SELECT page FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let original_facts: String = conn.query_row("SELECT facts FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let original_attempts: i64 = conn.query_row("SELECT attempts FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
+
+        let new_time = 9_999_999;
+        touch_scanned(&conn, 1, new_time).unwrap();
+
+        let updated_time: i64 = conn.query_row("SELECT scanned_at FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(updated_time, new_time);
+
+        let status_after: String = conn.query_row("SELECT status FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let page_after: String = conn.query_row("SELECT page FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let facts_after: String = conn.query_row("SELECT facts FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
+        let attempts_after: i64 = conn.query_row("SELECT attempts FROM jobs WHERE id = 1", [], |r| r.get(0)).unwrap();
+
+        assert_eq!(status_after, original_status);
+        assert_eq!(page_after, original_page);
+        assert_eq!(facts_after, original_facts);
+        assert_eq!(attempts_after, original_attempts);
+    }
+
+    #[test]
+    fn stored_page_roundtrip() {
+        let mut conn = open_in_memory().unwrap();
+        let j1 = nj("j1", 100);
+        upsert_jobs(&mut conn, &[j1]).unwrap();
+
+        let page = PortalPage {
+            description: "Roundtrip test".to_string(),
+            questions: vec![crate::model::FormQuestion {
+                label: "Q1".to_string(),
+                options: vec!["A".to_string()],
+            }],
+        };
+        save_page(&conn, 1, &page, &Facts::unknown()).unwrap();
+
+        let loaded = stored_page(&conn, 1).unwrap();
+        assert_eq!(loaded, Some(page));
+
+        let non_existent = stored_page(&conn, 999).unwrap();
+        assert_eq!(non_existent, None);
     }
 }

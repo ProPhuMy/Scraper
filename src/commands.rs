@@ -64,6 +64,34 @@ pub enum Progress {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecheckAction {
+    Touch,
+    Save(crate::model::PortalPage),
+    MarkGone,
+}
+
+pub fn decide_recheck(
+    old_page: Option<&crate::model::PortalPage>,
+    fetched: &anyhow::Result<Fetched>,
+) -> RecheckAction {
+    match fetched {
+        Ok(Fetched::Gone) => RecheckAction::MarkGone,
+        Ok(Fetched::Page(new_page)) => {
+            if let Some(old) = old_page {
+                if old == new_page {
+                    RecheckAction::Touch
+                } else {
+                    RecheckAction::Save(new_page.clone())
+                }
+            } else {
+                RecheckAction::Save(new_page.clone())
+            }
+        }
+        Ok(Fetched::Unreadable(_)) | Err(_) => RecheckAction::Touch,
+    }
+}
+
 pub type Reporter = std::sync::Arc<dyn Fn(Progress) + Send + Sync>;
 
 pub fn format_progress(p: &Progress) -> Option<(bool, String)> {
@@ -171,17 +199,39 @@ pub async fn scan_with(
 ) -> anyhow::Result<()> {
     let conn = db::open(db_path)?;
     let pending = db::pending_jobs(&conn, limit)?;
+    let now = db::now_unix();
+    let recheck_limit = match limit {
+        Some(l) => l.saturating_sub(pending.len()).min(cfg.scan.recheck_max),
+        None => cfg.scan.recheck_max,
+    };
+    let recheck = if recheck_limit > 0 && cfg.scan.recheck_days > 0 {
+        db::recheck_jobs(&conn, cfg.scan.recheck_days, recheck_limit, now)?
+    } else {
+        Vec::new()
+    };
+    let pending_ids: std::collections::HashSet<i64> = pending.iter().map(|j| j.id).collect();
+    let recheck_filtered: Vec<crate::model::Job> = recheck
+        .into_iter()
+        .filter(|j| !pending_ids.contains(&j.id))
+        .collect();
+
+    let work_items: Vec<(crate::model::Job, bool)> = pending
+        .into_iter()
+        .map(|j| (j, false))
+        .chain(recheck_filtered.into_iter().map(|j| (j, true)))
+        .collect();
+
     let db_conn = Arc::new(Mutex::new(conn));
 
-    if pending.is_empty() {
+    if work_items.is_empty() {
         report(Progress::NothingToScan);
     } else {
-        let total = pending.len();
+        let total = work_items.len();
         report(Progress::ScanStarted { total });
 
         let global_sem = Arc::new(tokio::sync::Semaphore::new(cfg.scan.concurrency));
         let mut host_sems = HashMap::new();
-        for job in &pending {
+        for (job, _) in &work_items {
             let host = host_of(&job.url);
             host_sems
                 .entry(host)
@@ -193,7 +243,7 @@ pub async fn scan_with(
 
         let mut set = tokio::task::JoinSet::new();
 
-        for job in pending {
+        for (job, is_recheck) in work_items {
             let host = host_of(&job.url);
             let host_sem = host_sems.get(&host).expect("host semaphore exists").clone();
             let global_sem = global_sem.clone();
@@ -212,46 +262,96 @@ pub async fn scan_with(
                 drop(_global_permit);
                 drop(_host_permit);
 
-                let status = match fetch_res {
-                    Ok(Fetched::Page(p)) => {
-                        let facts = extract::extract(&job.title, &p, season_year);
-                        let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
-                        match db::save_page(&conn, job.id, &p, &facts) {
-                            Ok(()) => Status::RulesDone,
-                            Err(e) => {
-                                let err_str = format!("{e:#}");
-                                let _ = db::mark(&conn, job.id, Status::Error, Some(&err_str));
-                                Status::Error
+                let status = if !is_recheck {
+                    match fetch_res {
+                        Ok(Fetched::Page(p)) => {
+                            let facts = extract::extract(&job.title, &p, season_year);
+                            let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
+                            match db::save_page(&conn, job.id, &p, &facts) {
+                                Ok(()) => Status::RulesDone,
+                                Err(e) => {
+                                    let err_str = format!("{e:#}");
+                                    let _ = db::mark(&conn, job.id, Status::Error, Some(&err_str));
+                                    Status::Error
+                                }
                             }
                         }
-                    }
-                    Ok(Fetched::Gone) => {
-                        let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
-                        match db::mark(&conn, job.id, Status::Gone, None) {
-                            Ok(()) => Status::Gone,
-                            Err(e) => {
-                                let err_str = format!("{e:#}");
-                                let _ = db::mark(&conn, job.id, Status::Error, Some(&err_str));
-                                Status::Error
+                        Ok(Fetched::Gone) => {
+                            let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
+                            match db::mark(&conn, job.id, Status::Gone, None) {
+                                Ok(()) => Status::Gone,
+                                Err(e) => {
+                                    let err_str = format!("{e:#}");
+                                    let _ = db::mark(&conn, job.id, Status::Error, Some(&err_str));
+                                    Status::Error
+                                }
                             }
                         }
-                    }
-                    Ok(Fetched::Unreadable(why)) => {
-                        let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
-                        match db::mark(&conn, job.id, Status::Unreadable, Some(&why)) {
-                            Ok(()) => Status::Unreadable,
-                            Err(e) => {
-                                let err_str = format!("{e:#}");
-                                let _ = db::mark(&conn, job.id, Status::Error, Some(&err_str));
-                                Status::Error
+                        Ok(Fetched::Unreadable(why)) => {
+                            let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
+                            match db::mark(&conn, job.id, Status::Unreadable, Some(&why)) {
+                                Ok(()) => Status::Unreadable,
+                                Err(e) => {
+                                    let err_str = format!("{e:#}");
+                                    let _ = db::mark(&conn, job.id, Status::Error, Some(&err_str));
+                                    Status::Error
+                                }
                             }
                         }
+                        Err(e) => {
+                            let err_str = format!("{e:#}");
+                            let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
+                            let _ = db::mark(&conn, job.id, Status::Error, Some(&err_str));
+                            Status::Error
+                        }
                     }
-                    Err(e) => {
-                        let err_str = format!("{e:#}");
-                        let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
-                        let _ = db::mark(&conn, job.id, Status::Error, Some(&err_str));
-                        Status::Error
+                } else {
+                    let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
+                    let old_page = if matches!(fetch_res, Ok(Fetched::Page(_))) {
+                        db::stored_page(&conn, job.id).unwrap_or(None)
+                    } else {
+                        None
+                    };
+                    let action = decide_recheck(old_page.as_ref(), &fetch_res);
+                    match action {
+                        RecheckAction::MarkGone => {
+                            let _ = db::mark(&conn, job.id, Status::Gone, None);
+                            Status::Gone
+                        }
+                        RecheckAction::Save(p) => {
+                            let facts = extract::extract(&job.title, &p, season_year);
+                            // Text-only changes ("posted 3 days ago", banners) must not throw away
+                            // LLM answers: only re-save when the rule-extracted facts differ.
+                            let same_facts = old_page
+                                .as_ref()
+                                .map(|old| extract::extract(&job.title, old, season_year) == facts)
+                                .unwrap_or(false);
+                            if same_facts {
+                                let _ = db::touch_scanned(&conn, job.id, now);
+                                conn.query_row("SELECT status FROM jobs WHERE id = ?1", rusqlite::params![job.id], |r| r.get::<_, String>(0))
+                                    .ok()
+                                    .as_deref()
+                                    .map(Status::parse)
+                                    .unwrap_or(Status::RulesDone)
+                            } else {
+                                let _ = db::save_page(&conn, job.id, &p, &facts);
+                                Status::RulesDone
+                            }
+                        }
+                        RecheckAction::Touch => {
+                            let _ = db::touch_scanned(&conn, job.id, now);
+                            let current_status: Option<String> = conn
+                                .query_row(
+                                    "SELECT status FROM jobs WHERE id = ?1",
+                                    rusqlite::params![job.id],
+                                    |r| r.get(0),
+                                )
+                                .ok();
+                            current_status
+                                .as_deref()
+                                .map(Status::parse)
+                                .unwrap_or(Status::RulesDone)
+                        }
                     }
                 };
 
@@ -275,7 +375,8 @@ pub async fn scan_with(
         while let Some(res) = set.join_next().await {
             match res {
                 Ok(status) => match status {
-                    Status::RulesDone => rules_done_count += 1,
+                    // A touched llm_done row keeps its status and counts in the rules_done bucket in ScanFinished
+                    Status::RulesDone | Status::LlmDone => rules_done_count += 1,
                     Status::Unreadable => unreadable_count += 1,
                     Status::Gone => gone_count += 1,
                     Status::Error => error_count += 1,
@@ -537,5 +638,65 @@ mod tests {
         assert_eq!(timeout, 5000);
         drop(conn);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn recheck_failure_keeps_data() {
+        let page = crate::model::PortalPage {
+            description: "desc".to_string(),
+            questions: vec![],
+        };
+        let err: anyhow::Result<Fetched> = Err(anyhow::anyhow!("timeout or 403"));
+        assert_eq!(decide_recheck(Some(&page), &err), RecheckAction::Touch);
+
+        let unreadable: anyhow::Result<Fetched> = Ok(Fetched::Unreadable("blocked".into()));
+        assert_eq!(decide_recheck(Some(&page), &unreadable), RecheckAction::Touch);
+
+        assert_eq!(decide_recheck(None, &err), RecheckAction::Touch);
+    }
+
+    #[test]
+    fn recheck_unchanged_keeps_llm() {
+        let page = crate::model::PortalPage {
+            description: "same desc".to_string(),
+            questions: vec![],
+        };
+        let fetched: anyhow::Result<Fetched> = Ok(Fetched::Page(page.clone()));
+        assert_eq!(decide_recheck(Some(&page), &fetched), RecheckAction::Touch);
+    }
+
+    #[test]
+    fn recheck_changed_saves() {
+        let old_page = crate::model::PortalPage {
+            description: "old desc".to_string(),
+            questions: vec![],
+        };
+        let new_page = crate::model::PortalPage {
+            description: "new desc".to_string(),
+            questions: vec![],
+        };
+        let fetched: anyhow::Result<Fetched> = Ok(Fetched::Page(new_page.clone()));
+        assert_eq!(
+            decide_recheck(Some(&old_page), &fetched),
+            RecheckAction::Save(new_page.clone())
+        );
+
+        assert_eq!(
+            decide_recheck(None, &fetched),
+            RecheckAction::Save(new_page)
+        );
+    }
+
+    #[test]
+    fn recheck_gone_marks_gone() {
+        let old_page = crate::model::PortalPage {
+            description: "desc".to_string(),
+            questions: vec![],
+        };
+        let fetched: anyhow::Result<Fetched> = Ok(Fetched::Gone);
+        assert_eq!(
+            decide_recheck(Some(&old_page), &fetched),
+            RecheckAction::MarkGone
+        );
     }
 }
