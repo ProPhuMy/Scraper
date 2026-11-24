@@ -4,8 +4,13 @@ use regex::Regex;
 use crate::extract::{ev, Input};
 use crate::model::{Citizenship, Fact, Source};
 
+static CITIZENSHIP_NEGATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(not required|not needed|not a requirement|is not necessary|not necessary)\b|\bno\s+(\w+\s+){0,3}?(clearance|citizenship)\b")
+        .expect("valid regex")
+});
+
 static US_CITIZEN_REQUIRED_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(us citizens?|us citizenship)\b.*?\b(required|must|only)\b|\b(required|must|only)\b.*?\b(us citizens?|us citizenship)\b")
+    Regex::new(r"\b(us citizens?|us citizenship)\b.*?\b(required|must)\b|\b(required|must)\b.*?\b(us citizens?|us citizenship)\b|\b(open\s+)?only\s+(to\s+)?(us\s+)?citizens?\b|\b(us\s+)?citizens?\s+only\b")
         .expect("valid regex")
 });
 
@@ -36,12 +41,15 @@ static CITIZENSHIP_KEYWORDS_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid regex")
 });
 
+fn is_citizenship_negated(sent: &str) -> bool {
+    CITIZENSHIP_NEGATION_RE.is_match(sent)
+}
+
 pub fn citizenship(inp: &Input) -> Fact<Citizenship> {
-    // 1. Not required first. A sentence with clearance plus (not required | no clearance | not needed) -> NotMentioned, with evidence.
+    // 1. Not required first. A sentence with clearance or citizenship negated -> NotMentioned, with evidence.
     for sent in &inp.sentences {
-        let has_clearance = sent.contains("clearance");
-        let not_req = sent.contains("not required") || sent.contains("no clearance") || sent.contains("not needed");
-        if has_clearance && not_req {
+        let mentions_topic = sent.contains("clearance") || sent.contains("citizen");
+        if mentions_topic && is_citizenship_negated(sent) {
             return Fact {
                 value: Citizenship::NotMentioned,
                 evidence: ev(Source::Description, sent),
@@ -69,7 +77,11 @@ pub fn citizenship(inp: &Input) -> Fact<Citizenship> {
     // - clearance with (required | must | ability to obtain | able to obtain | eligible to obtain | obtain and maintain | active)
     // - top secret, ts/sci, secret clearance
     for sent in &inp.sentences {
-        let citizen_req = US_CITIZEN_REQUIRED_RE.is_match(sent);
+        if is_citizenship_negated(sent) {
+            continue;
+        }
+
+        let citizen_req = !sent.contains("not only") && US_CITIZEN_REQUIRED_RE.is_match(sent);
         let us_person = US_PERSON_RE.is_match(sent);
         let perm_res = PERM_RESIDENT_REQUIRED_RE.is_match(sent);
         let clearance_req = sent.contains("clearance") && CLEARANCE_REQUIRED_RE.is_match(sent);
@@ -139,6 +151,10 @@ mod tests {
             ("Active TS/SCI clearance required.", Required),
             ("Due to ITAR, applicants must be U.S. persons.", Required),
             ("No clearance required for this role.", NotMentioned),
+            ("No security clearance is required.", NotMentioned),
+            ("US citizenship is not required for this role.", NotMentioned),
+            ("A clearance is not needed.", NotMentioned),
+            ("Citizenship is not a requirement; international students welcome.", NotMentioned),
             ("Security clearance preferred.", Unknown),
             ("This role is subject to export control regulations.", Unknown),
             ("We build robots.", NotMentioned),
