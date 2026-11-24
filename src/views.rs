@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+
 use crate::config::Profile;
 use crate::db::{Marks, Row};
 use crate::verdict::{judge, Judgement, Verdict};
@@ -93,6 +95,7 @@ pub fn build_view<'a>(
             } else {
                 row.job.company.to_lowercase().contains(&needle)
                     || row.job.title.to_lowercase().contains(&needle)
+                    || row.locations.iter().any(|loc| loc.to_lowercase().contains(&needle))
             }
         })
         .map(|row| {
@@ -140,6 +143,227 @@ pub fn tab_count(
     season_year: u16,
 ) -> usize {
     build_view(rows, tab, filter, search, profile, season_year).len()
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct LocRowKey {
+    company: String,
+    title: String,
+    verdict: u8,
+    locations: Vec<String>,
+}
+
+fn verdict_key(v: Verdict) -> u8 {
+    match v {
+        Verdict::Apply => 0,
+        Verdict::Maybe => 1,
+        Verdict::No => 2,
+    }
+}
+
+fn make_loc_row_key(vr: &ViewRow) -> LocRowKey {
+    let mut locs: Vec<String> = vr
+        .row
+        .locations
+        .iter()
+        .map(|loc| loc.trim().to_lowercase())
+        .collect();
+    locs.sort();
+    LocRowKey {
+        company: vr.row.job.company.trim().to_lowercase(),
+        title: vr.row.job.title.trim().to_lowercase(),
+        verdict: verdict_key(vr.judgement.verdict),
+        locations: locs,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocRow<'a> {
+    pub members: Vec<ViewRow<'a>>,
+}
+
+impl<'a> LocRow<'a> {
+    pub fn newest(&self) -> &ViewRow<'a> {
+        &self.members[0]
+    }
+
+    pub fn marks(&self) -> Marks {
+        Marks {
+            starred: self.members.iter().any(|m| m.row.marks.starred),
+            hidden: self.members.iter().any(|m| m.row.marks.hidden),
+            applied_at: self.members.iter().filter_map(|m| m.row.marks.applied_at).max(),
+        }
+    }
+
+    pub fn is_new(&self) -> bool {
+        self.members.iter().any(|m| m.row.is_new)
+    }
+
+    pub fn label(&self) -> String {
+        let newest = self.newest();
+        let locs = &newest.row.locations;
+        let mut s = if locs.is_empty() || locs[0].trim().is_empty() {
+            "(no location)".to_string()
+        } else {
+            let mut base = locs[0].clone();
+            if locs.len() > 1 {
+                base.push_str(&format!(" +{}", locs.len() - 1));
+            }
+            base
+        };
+        if self.members.len() > 1 {
+            s.push_str(&format!(" ({} links)", self.members.len()));
+        }
+        s
+    }
+
+    pub fn job_ids(&self) -> Vec<i64> {
+        self.members.iter().map(|m| m.row.job.id).collect()
+    }
+}
+
+pub fn merge_locations<'a>(view: Vec<ViewRow<'a>>) -> Vec<LocRow<'a>> {
+    let mut map: HashMap<LocRowKey, usize> = HashMap::new();
+    let mut result: Vec<LocRow<'a>> = Vec::new();
+
+    for vr in view {
+        let key = make_loc_row_key(&vr);
+        if let Some(&idx) = map.get(&key) {
+            result[idx].members.push(vr);
+        } else {
+            map.insert(key, result.len());
+            result.push(LocRow {
+                members: vec![vr],
+            });
+        }
+    }
+
+    for loc_row in &mut result {
+        loc_row.members.sort_by(|a, b| {
+            b.row
+                .date_posted
+                .cmp(&a.row.date_posted)
+                .then_with(|| b.row.job.id.cmp(&a.row.job.id))
+        });
+    }
+
+    result
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct GroupKey {
+    company: String,
+    title: String,
+    verdict: u8,
+}
+
+fn make_group_key(loc: &LocRow) -> GroupKey {
+    let newest = loc.newest();
+    GroupKey {
+        company: newest.row.job.company.trim().to_lowercase(),
+        title: newest.row.job.title.trim().to_lowercase(),
+        verdict: verdict_key(newest.judgement.verdict),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Group<'a> {
+    pub rows: Vec<LocRow<'a>>,
+}
+
+pub fn group_view<'a>(locs: Vec<LocRow<'a>>) -> Vec<Group<'a>> {
+    let mut map: HashMap<GroupKey, usize> = HashMap::new();
+    let mut groups: Vec<Group<'a>> = Vec::new();
+
+    for loc in locs {
+        let key = make_group_key(&loc);
+        if let Some(&idx) = map.get(&key) {
+            groups[idx].rows.push(loc);
+        } else {
+            map.insert(key, groups.len());
+            groups.push(Group { rows: vec![loc] });
+        }
+    }
+
+    groups
+}
+
+pub fn toggle_many(
+    current: &[Marks],
+    key: MarkKey,
+    now: i64,
+) -> Result<Vec<Marks>, &'static str> {
+    match key {
+        MarkKey::Star => {
+            let any_starred = current.iter().any(|m| m.starred);
+            if any_starred {
+                Ok(current
+                    .iter()
+                    .map(|m| Marks {
+                        starred: false,
+                        hidden: m.hidden,
+                        applied_at: m.applied_at,
+                    })
+                    .collect())
+            } else {
+                Ok(current
+                    .iter()
+                    .map(|m| Marks {
+                        starred: true,
+                        hidden: false,
+                        applied_at: m.applied_at,
+                    })
+                    .collect())
+            }
+        }
+        MarkKey::Hide => {
+            if current.iter().any(|m| m.applied_at.is_some()) {
+                return Err("applied jobs can't be hidden");
+            }
+            let any_hidden = current.iter().any(|m| m.hidden);
+            if any_hidden {
+                Ok(current
+                    .iter()
+                    .map(|m| Marks {
+                        starred: m.starred,
+                        hidden: false,
+                        applied_at: m.applied_at,
+                    })
+                    .collect())
+            } else {
+                Ok(current
+                    .iter()
+                    .map(|m| Marks {
+                        starred: false,
+                        hidden: true,
+                        applied_at: m.applied_at,
+                    })
+                    .collect())
+            }
+        }
+        MarkKey::Applied => {
+            let any_applied = current.iter().any(|m| m.applied_at.is_some());
+            if any_applied {
+                Ok(current
+                    .iter()
+                    .map(|m| Marks {
+                        starred: m.starred,
+                        hidden: m.hidden,
+                        applied_at: None,
+                    })
+                    .collect())
+            } else {
+                Ok(current
+                    .iter()
+                    .map(|m| Marks {
+                        starred: m.starred,
+                        hidden: m.hidden,
+                        applied_at: Some(now),
+                    })
+                    .collect())
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -539,5 +763,370 @@ mod tests {
         let view2 = build_view(&rows2, Tab::Jobs, VerdictFilter::ApplyMaybe, "", &p2, 2027);
         assert_eq!(view2.len(), 1);
         assert_eq!(view2[0].judgement.verdict, Verdict::Apply);
+    }
+
+    fn make_row_with_locs(
+        id: i64,
+        company: &str,
+        title: &str,
+        active: bool,
+        marks: Marks,
+        status: Status,
+        facts: Option<Facts>,
+        date_posted: i64,
+        locations: Vec<String>,
+    ) -> Row {
+        let mut r = make_row(id, company, title, active, marks, status, facts, date_posted);
+        r.locations = locations;
+        r
+    }
+
+    #[test]
+    fn location_list_order_insensitive() {
+        // postings A ["SF","NYC"], B ["NYC","SF"] same company/title/verdict -> 1 LocRow with 2 members; C ["SF"] -> separate LocRow
+        let row_a = make_row_with_locs(
+            1,
+            "Acme",
+            "Engineer",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            100,
+            vec!["SF".to_string(), "NYC".to_string()],
+        );
+        let row_b = make_row_with_locs(
+            2,
+            "Acme",
+            "Engineer",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            200,
+            vec!["NYC".to_string(), "SF".to_string()],
+        );
+        let row_c = make_row_with_locs(
+            3,
+            "Acme",
+            "Engineer",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            150,
+            vec!["SF".to_string()],
+        );
+        let profile = test_profile();
+        let rows = [row_a, row_b, row_c];
+        let view = build_view(&rows, Tab::Jobs, VerdictFilter::All, "", &profile, 2027);
+        let loc_rows = merge_locations(view);
+        assert_eq!(loc_rows.len(), 2);
+        assert_eq!(loc_rows[0].members.len(), 2);
+        assert_eq!(loc_rows[1].members.len(), 1);
+    }
+
+    #[test]
+    fn verdict_splits_groups() {
+        // same company+title, one Apply one No -> 2 groups
+        let mut no_facts = clean_facts();
+        no_facts.citizenship.value = Citizenship::Required;
+        let row_apply = make_row(
+            1,
+            "Acme",
+            "Engineer",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            100,
+        );
+        let row_no = make_row(
+            2,
+            "Acme",
+            "Engineer",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(no_facts),
+            200,
+        );
+        let profile = test_profile();
+        let rows = [row_apply, row_no];
+        let view = build_view(&rows, Tab::Jobs, VerdictFilter::All, "", &profile, 2027);
+        let loc_rows = merge_locations(view);
+        let groups = group_view(loc_rows);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn group_order_and_star_pin() {
+        // sorted view [starred L3Harris SLC, Acme, L3Harris SD] -> groups [L3Harris(2 loc rows), Acme]
+        let l3_slc = make_row_with_locs(
+            1,
+            "L3Harris",
+            "Intern",
+            true,
+            Marks {
+                starred: true,
+                hidden: false,
+                applied_at: None,
+            },
+            Status::RulesDone,
+            Some(clean_facts()),
+            100,
+            vec!["Salt Lake City, UT".into()],
+        );
+        let acme = make_row_with_locs(
+            2,
+            "Acme",
+            "Intern",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            100,
+            vec!["Remote".into()],
+        );
+        let l3_sd = make_row_with_locs(
+            3,
+            "L3Harris",
+            "Intern",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            50,
+            vec!["San Diego, CA".into()],
+        );
+        let profile = test_profile();
+        let rows = [l3_slc, acme, l3_sd];
+        let view = build_view(&rows, Tab::Jobs, VerdictFilter::All, "", &profile, 2027);
+        let loc_rows = merge_locations(view);
+        let groups = group_view(loc_rows);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].rows.len(), 2);
+        assert_eq!(groups[0].rows[0].newest().row.job.company, "L3Harris");
+        assert_eq!(groups[1].rows.len(), 1);
+        assert_eq!(groups[1].rows[0].newest().row.job.company, "Acme");
+    }
+
+    #[test]
+    fn merged_marks_any_rule() {
+        // LocRow of 2 postings, one starred: marks().starred == true; toggle_many(Star) -> both false;
+        // none starred -> both true; one applied -> toggle_many(Hide) == Err("applied jobs can't be hidden")
+        let row1 = make_row(
+            1,
+            "Acme",
+            "Engineer",
+            true,
+            Marks {
+                starred: true,
+                hidden: false,
+                applied_at: None,
+            },
+            Status::RulesDone,
+            Some(clean_facts()),
+            100,
+        );
+        let row2 = make_row(
+            2,
+            "Acme",
+            "Engineer",
+            true,
+            Marks {
+                starred: false,
+                hidden: false,
+                applied_at: None,
+            },
+            Status::RulesDone,
+            Some(clean_facts()),
+            100,
+        );
+        let profile = test_profile();
+        let rows = [row1, row2];
+        let view = build_view(&rows, Tab::Jobs, VerdictFilter::All, "", &profile, 2027);
+        let loc_rows = merge_locations(view);
+        assert_eq!(loc_rows.len(), 1);
+        assert_eq!(loc_rows[0].marks().starred, true);
+
+        let now = 1000;
+        let marks_in = [rows[0].marks, rows[1].marks];
+        let res_star = toggle_many(&marks_in, MarkKey::Star, now).unwrap();
+        assert_eq!(
+            res_star,
+            vec![
+                Marks {
+                    starred: false,
+                    hidden: false,
+                    applied_at: None,
+                },
+                Marks {
+                    starred: false,
+                    hidden: false,
+                    applied_at: None,
+                },
+            ]
+        );
+
+        let marks_unstarred = [
+            Marks {
+                starred: false,
+                hidden: false,
+                applied_at: None,
+            },
+            Marks {
+                starred: false,
+                hidden: false,
+                applied_at: None,
+            },
+        ];
+        let res_star_on = toggle_many(&marks_unstarred, MarkKey::Star, now).unwrap();
+        assert_eq!(
+            res_star_on,
+            vec![
+                Marks {
+                    starred: true,
+                    hidden: false,
+                    applied_at: None,
+                },
+                Marks {
+                    starred: true,
+                    hidden: false,
+                    applied_at: None,
+                },
+            ]
+        );
+
+        let marks_applied = [
+            Marks {
+                starred: false,
+                hidden: false,
+                applied_at: Some(500),
+            },
+            Marks {
+                starred: false,
+                hidden: false,
+                applied_at: None,
+            },
+        ];
+        let res_hide = toggle_many(&marks_applied, MarkKey::Hide, now);
+        assert_eq!(res_hide, Err("applied jobs can't be hidden"));
+    }
+
+    #[test]
+    fn labels() {
+        // ["Atlanta, GA","Boston, MA","X","Y","Z"] 1 posting -> "Atlanta, GA +4"; 2 postings ["Salt Lake City, UT"] -> "Salt Lake City, UT (2 links)"; [] -> "(no location)"
+        let row1 = make_row_with_locs(
+            1,
+            "Acme",
+            "Engineer",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            300,
+            vec![
+                "Atlanta, GA".into(),
+                "Boston, MA".into(),
+                "X".into(),
+                "Y".into(),
+                "Z".into(),
+            ],
+        );
+        let row2a = make_row_with_locs(
+            2,
+            "Beta",
+            "Dev",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            100,
+            vec!["Salt Lake City, UT".into()],
+        );
+        let row2b = make_row_with_locs(
+            3,
+            "Beta",
+            "Dev",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            200,
+            vec!["Salt Lake City, UT".into()],
+        );
+        let row3 = make_row_with_locs(
+            4,
+            "Gamma",
+            "QA",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            100,
+            vec![],
+        );
+        let profile = test_profile();
+        let rows = [row1, row2a, row2b, row3];
+        let view = build_view(&rows, Tab::Jobs, VerdictFilter::All, "", &profile, 2027);
+        let loc_rows = merge_locations(view);
+        assert_eq!(loc_rows.len(), 3);
+        assert_eq!(loc_rows[0].label(), "Atlanta, GA +4");
+        assert_eq!(loc_rows[1].label(), "Salt Lake City, UT (2 links)");
+        assert_eq!(loc_rows[2].label(), "(no location)");
+    }
+
+    #[test]
+    fn newest_member_first() {
+        // date_posted 100 and 200 -> newest().row.date_posted == 200
+        let row1 = make_row(
+            1,
+            "Acme",
+            "Engineer",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            100,
+        );
+        let row2 = make_row(
+            2,
+            "Acme",
+            "Engineer",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            200,
+        );
+        let profile = test_profile();
+        let rows = [row1, row2];
+        let view = build_view(&rows, Tab::Jobs, VerdictFilter::All, "", &profile, 2027);
+        let loc_rows = merge_locations(view);
+        assert_eq!(loc_rows.len(), 1);
+        assert_eq!(loc_rows[0].newest().row.date_posted, 200);
+        assert_eq!(loc_rows[0].members[0].row.date_posted, 200);
+    }
+
+    #[test]
+    fn search_matches_location() {
+        // search "rochester" finds a row with location "Rochester, NY"
+        let row = make_row_with_locs(
+            1,
+            "Acme",
+            "Engineer",
+            true,
+            Marks::default(),
+            Status::RulesDone,
+            Some(clean_facts()),
+            100,
+            vec!["Rochester, NY".into()],
+        );
+        let profile = test_profile();
+        let rows = [row];
+        let view = build_view(&rows, Tab::Jobs, VerdictFilter::All, "rochester", &profile, 2027);
+        assert_eq!(view.len(), 1);
+        assert_eq!(view[0].row.job.company, "Acme");
     }
 }
