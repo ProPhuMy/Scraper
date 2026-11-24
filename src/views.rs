@@ -210,6 +210,8 @@ mod tests {
             active,
             marks,
             is_new: false,
+            locations: vec![],
+            asks_location: false,
         }
     }
 
