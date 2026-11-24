@@ -9,6 +9,11 @@ static CITIZENSHIP_NEGATION_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid regex")
 });
 
+static CLEARANCE_NONE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bclearance\b[^.!?;\n]{0,40}?(:\s*(none|no|not applicable|n/a)\b|\b(is\s+)?(none|not applicable|n/a)\b)")
+        .expect("valid regex")
+});
+
 static US_CITIZEN_REQUIRED_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(us citizens?|us citizenship)\b.*?\b(required|must)\b|\b(required|must)\b.*?\b(us citizens?|us citizenship)\b|\b(open\s+)?only\s+(to\s+)?(us\s+)?citizens?\b|\b(us\s+)?citizens?\s+only\b")
         .expect("valid regex")
@@ -41,12 +46,47 @@ static CITIZENSHIP_KEYWORDS_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid regex")
 });
 
-fn is_citizenship_negated(sent: &str) -> bool {
-    CITIZENSHIP_NEGATION_RE.is_match(sent)
+static HEDGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(may need to|may require|might require|could require|any citizenship)\b")
+        .expect("valid regex")
+});
+
+static DIRECT_FORM_QUESTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(are you a (us |u\.s\. )?citizen|what is your citizenship status|citizenship status\?|do you (currently )?(hold|have) (an? )?(active )?(us |u\.s\. )?security clearance|current clearance level)\b")
+        .expect("valid regex")
+});
+
+fn is_citizenship_negated(text: &str) -> bool {
+    CITIZENSHIP_NEGATION_RE.is_match(text) || CLEARANCE_NONE_RE.is_match(text)
+}
+
+fn is_public_trust_unknown(text: &str) -> bool {
+    if !text.contains("public trust") {
+        return false;
+    }
+    !text.contains("citizen")
+        && !text.contains("secret")
+        && !text.contains("top secret")
+        && !text.contains("ts/sci")
+        && !text.contains("ts-sci")
+}
+
+fn has_non_citizen_alternative(text: &str) -> bool {
+    text.contains("or able to obtain an export license")
+        || text.contains("export license")
+        || text.contains("non-us person")
+}
+
+fn is_hedge_unknown(text: &str) -> bool {
+    HEDGE_RE.is_match(text)
+}
+
+fn is_direct_form_question(text: &str) -> bool {
+    DIRECT_FORM_QUESTION_RE.is_match(text)
 }
 
 pub fn citizenship(inp: &Input) -> Fact<Citizenship> {
-    // 1. Not required first. A sentence with clearance or citizenship negated -> NotMentioned, with evidence.
+    // 1. Not required first. Clearance or citizenship negated -> NotMentioned, with evidence.
     for sent in &inp.sentences {
         let mentions_topic = sent.contains("clearance") || sent.contains("citizen");
         if mentions_topic && is_citizenship_negated(sent) {
@@ -56,28 +96,55 @@ pub fn citizenship(inp: &Input) -> Fact<Citizenship> {
             };
         }
     }
+    for q in &inp.questions {
+        let mentions_topic = q.label.contains("clearance") || q.label.contains("citizen");
+        if mentions_topic && is_citizenship_negated(&q.label) {
+            return Fact {
+                value: Citizenship::NotMentioned,
+                evidence: ev(Source::Form, &q.label),
+            };
+        }
+    }
 
     // 2. Required:
-    // Form: a question label containing clearance, or citizen (but not authorized to work), or country of citizenship.
+    // Form: question label
     for q in &inp.questions {
+        if is_citizenship_negated(&q.label) {
+            continue;
+        }
+        let is_direct = is_direct_form_question(&q.label);
+        if !is_direct {
+            if is_public_trust_unknown(&q.label)
+                || has_non_citizen_alternative(&q.label)
+                || is_hedge_unknown(&q.label)
+            {
+                continue;
+            }
+        }
+
         let has_clearance = q.label.contains("clearance");
         let has_citizen = q.label.contains("citizen") && !q.label.contains("authorized to work");
         let has_country = q.label.contains("country of citizenship");
-        if has_clearance || has_citizen || has_country {
+        let has_us_person = q.label.contains("us person");
+        if has_clearance || has_citizen || has_country || has_us_person {
             return Fact {
                 value: Citizenship::Required,
                 evidence: ev(Source::Form, &q.label),
             };
         }
     }
-    // Description: any of
-    // - us citizen(s|ship) with (required | must | only)
-    // - us person
-    // - permanent resident with must|only
-    // - clearance with (required | must | ability to obtain | able to obtain | eligible to obtain | obtain and maintain | active)
-    // - top secret, ts/sci, secret clearance
+    // Description:
     for sent in &inp.sentences {
         if is_citizenship_negated(sent) {
+            continue;
+        }
+        if is_public_trust_unknown(sent) {
+            continue;
+        }
+        if has_non_citizen_alternative(sent) {
+            continue;
+        }
+        if is_hedge_unknown(sent) {
             continue;
         }
 
@@ -96,15 +163,27 @@ pub fn citizenship(inp: &Input) -> Fact<Citizenship> {
     }
 
     // 3. Unknown:
-    // - clearance with preferred|a plus|desired
-    // - a bare itar or export control sentence with no us person or citizen
+    for q in &inp.questions {
+        if is_public_trust_unknown(&q.label)
+            || has_non_citizen_alternative(&q.label)
+            || is_hedge_unknown(&q.label)
+        {
+            return Fact {
+                value: Citizenship::Unknown,
+                evidence: ev(Source::Form, &q.label),
+            };
+        }
+    }
     for sent in &inp.sentences {
+        let public_trust = is_public_trust_unknown(sent);
+        let alt = has_non_citizen_alternative(sent);
+        let hedge = is_hedge_unknown(sent);
         let clearance_pref = sent.contains("clearance") && CLEARANCE_UNKNOWN_RE.is_match(sent);
         let bare_export = (sent.contains("itar") || sent.contains("export control"))
             && !sent.contains("us person")
             && !sent.contains("citizen");
 
-        if clearance_pref || bare_export {
+        if public_trust || alt || hedge || clearance_pref || bare_export {
             return Fact {
                 value: Citizenship::Unknown,
                 evidence: ev(Source::Description, sent),
@@ -158,9 +237,42 @@ mod tests {
             ("Security clearance preferred.", Unknown),
             ("This role is subject to export control regulations.", Unknown),
             ("We build robots.", NotMentioned),
+            ("minimum clearance required to start: none", NotMentioned),
+            ("clearance required for start: no", NotMentioned),
+            ("minimum clearance required to start: public trust", Unknown),
+            ("- candidates must have the ability to obtain and maintain a public trust clearance", Unknown),
+            ("applicants for these positions may need to be \"us persons,\" as defined in these regulations", Unknown),
+            ("all applicants are asked to provide documentation that legally establishes status as a us person or non-us person (and nationalities in the case of a non-us person)", Unknown),
+            ("- must meet applicable us government contract eligibility requirements, including any citizenship or security clearance requirements associated with the role", Unknown),
+            ("- ability to obtain a secret clearance", Required),
+            ("due to classified work at the facility and related access restrictions, successful applicants must be us citizens", Required),
+            ("- must be a us person due to required access to us export-controlled information or facilities", Required),
+            ("clearance required for start: yes", Required),
+            ("- active ts/sci clearance", Required),
         ];
         for (t, want) in cases {
             assert_eq!(citizenship(&Input::from_text(t)).value, want, "{t}");
+        }
+    }
+
+    #[test]
+    fn form_question_rules() {
+        let cases = [
+            ("as a result of the work performed by cesiumastro, all eligible candidates must be a us person or able to obtain an export license. us persons include...", Citizenship::Unknown),
+            ("this position may require access to information, technology, software, or hardware that is subject to us export control laws and regulations", Citizenship::Unknown),
+            ("do you currently hold an active us security clearance?", Citizenship::Required),
+            ("are you a us citizen?", Citizenship::Required),
+            ("what is your citizenship status?", Citizenship::Required),
+        ];
+        for (label, want) in cases {
+            let page = PortalPage {
+                description: "x".repeat(300),
+                questions: vec![FormQuestion {
+                    label: label.into(),
+                    options: vec![],
+                }],
+            };
+            assert_eq!(citizenship(&Input::new("t", &page)).value, want, "{label}");
         }
     }
 
