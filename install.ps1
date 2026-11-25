@@ -54,14 +54,14 @@ function Install-Scraper {
         try {
             Invoke-WebRequest -Uri $url -OutFile $downloadExe -UseBasicParsing
         } catch {
-            Write-Host "scraper-install: failed to download asset from $url" -ForegroundColor Red
+            Write-Host "scraper-install: failed to download asset from ${url}: $($_.Exception.Message)" -ForegroundColor Red
             return
         }
 
         try {
             Invoke-WebRequest -Uri $checksumUrl -OutFile $downloadSha -UseBasicParsing
         } catch {
-            Write-Host "scraper-install: failed to download checksum from $checksumUrl" -ForegroundColor Red
+            Write-Host "scraper-install: failed to download checksum from ${checksumUrl}: $($_.Exception.Message)" -ForegroundColor Red
             return
         }
 
@@ -83,7 +83,7 @@ function Install-Scraper {
                 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
             }
         } catch {
-            Write-Host "scraper-install: failed to create directory $installDir" -ForegroundColor Red
+            Write-Host "scraper-install: failed to create directory ${installDir}: $($_.Exception.Message)" -ForegroundColor Red
             return
         }
 
@@ -91,7 +91,7 @@ function Install-Scraper {
         try {
             Move-Item -LiteralPath $downloadExe -Destination $targetExe -Force
         } catch {
-            Write-Host "scraper-install: could not replace $targetExe; close any running scraper and try again" -ForegroundColor Red
+            Write-Host "scraper-install: could not replace ${targetExe}: $($_.Exception.Message). Close any running scraper and try again" -ForegroundColor Red
             return
         }
 
