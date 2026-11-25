@@ -139,6 +139,11 @@ pub(crate) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     }
     tx.commit()?;
 
+    conn.execute(
+        "UPDATE jobs SET status = 'pending' WHERE status = 'unreadable' AND scanned_at IS NULL",
+        [],
+    )?;
+
     let sync_count_exists: bool = conn
         .query_row(
             "SELECT 1 FROM meta WHERE key = 'sync_count'",
@@ -363,16 +368,25 @@ pub fn save_page(conn: &Connection, job_id: i64, page: &PortalPage, facts: &Fact
 }
 
 pub fn mark(conn: &Connection, job_id: i64, status: Status, error: Option<&str>) -> anyhow::Result<()> {
-    if matches!(status, Status::Error) {
-        conn.execute(
-            "UPDATE jobs SET status = ?1, last_error = ?2, attempts = attempts + 1 WHERE id = ?3",
-            params![status.as_str(), error, job_id],
-        )?;
-    } else {
-        conn.execute(
-            "UPDATE jobs SET status = ?1, last_error = ?2 WHERE id = ?3",
-            params![status.as_str(), error, job_id],
-        )?;
+    match status {
+        Status::Error => {
+            conn.execute(
+                "UPDATE jobs SET status = ?1, last_error = ?2, attempts = attempts + 1 WHERE id = ?3",
+                params![status.as_str(), error, job_id],
+            )?;
+        }
+        Status::Unreadable => {
+            conn.execute(
+                "UPDATE jobs SET status = ?1, last_error = ?2, scanned_at = CAST(strftime('%s', 'now') AS INTEGER) WHERE id = ?3",
+                params![status.as_str(), error, job_id],
+            )?;
+        }
+        _ => {
+            conn.execute(
+                "UPDATE jobs SET status = ?1, last_error = ?2 WHERE id = ?3",
+                params![status.as_str(), error, job_id],
+            )?;
+        }
     }
     Ok(())
 }
@@ -1648,5 +1662,206 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].facts, Some(rules_facts));
         assert_eq!(rows[0].llm_facts, None);
+    }
+
+    #[test]
+    fn mark_unreadable_sets_scanned_at() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        let b = nj("b", 100);
+        let d = nj("d", 100);
+        upsert_jobs(&mut c, &[a, b, d]).unwrap();
+
+        let before = now_unix();
+        mark(&c, 1, Status::Unreadable, Some("x")).unwrap();
+        let after = now_unix();
+
+        let (status, scanned_at, last_error, attempts): (String, Option<i64>, Option<String>, i64) = c
+            .query_row(
+                "SELECT status, scanned_at, last_error, attempts FROM jobs WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(status, "unreadable");
+        assert!(scanned_at.is_some());
+        let ts = scanned_at.unwrap();
+        assert!(ts >= before && ts <= after + 1);
+        assert_eq!(last_error.as_deref(), Some("x"));
+        assert_eq!(attempts, 0);
+
+        // mark Status::Gone on another job leaves scanned_at NULL
+        mark(&c, 2, Status::Gone, None).unwrap();
+        let (status_b, scanned_at_b, attempts_b): (String, Option<i64>, i64) = c
+            .query_row(
+                "SELECT status, scanned_at, attempts FROM jobs WHERE id = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status_b, "gone");
+        assert_eq!(scanned_at_b, None);
+        assert_eq!(attempts_b, 0);
+
+        // mark Status::Error leaves scanned_at NULL and increments attempts
+        mark(&c, 3, Status::Error, Some("err")).unwrap();
+        let (status_d, scanned_at_d, attempts_d): (String, Option<i64>, i64) = c
+            .query_row(
+                "SELECT status, scanned_at, attempts FROM jobs WHERE id = 3",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status_d, "error");
+        assert_eq!(scanned_at_d, None);
+        assert_eq!(attempts_d, 1);
+    }
+
+    #[test]
+    fn open_requeues_legacy_unreadable() {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("test_scraper_db_unreadable_{}", nanos));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        {
+            let mut conn = open(&db_path).unwrap();
+            let a = nj("a", 100);
+            let b = nj("b", 100);
+            let c = nj("c", 100);
+            let d = nj("d", 100);
+            let e = nj("e", 100);
+            upsert_jobs(&mut conn, &[a, b, c, d, e]).unwrap();
+
+            // Set up row A: status='unreadable', scanned_at NULL, attempts=2, last_error='legacy err', marks set
+            conn.execute(
+                "UPDATE jobs SET status = 'unreadable', scanned_at = NULL, attempts = 2, last_error = 'legacy err', starred = 1, applied_at = 9999 WHERE simplify_id = 'a'",
+                [],
+            )
+            .unwrap();
+            // Set up row B: status='unreadable', scanned_at=123
+            conn.execute(
+                "UPDATE jobs SET status = 'unreadable', scanned_at = 123 WHERE simplify_id = 'b'",
+                [],
+            )
+            .unwrap();
+            // Set up row C: status='rules_done', scanned_at NULL
+            conn.execute(
+                "UPDATE jobs SET status = 'rules_done', scanned_at = NULL WHERE simplify_id = 'c'",
+                [],
+            )
+            .unwrap();
+            // Set up row D: status='error', scanned_at NULL
+            conn.execute(
+                "UPDATE jobs SET status = 'error', scanned_at = NULL WHERE simplify_id = 'd'",
+                [],
+            )
+            .unwrap();
+            // Set up row E: status='gone', scanned_at NULL
+            conn.execute(
+                "UPDATE jobs SET status = 'gone', scanned_at = NULL WHERE simplify_id = 'e'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // First re-open: should requeue row A to pending, leaving others untouched
+        {
+            let conn = open(&db_path).unwrap();
+            let (status_a, scanned_at_a, attempts_a, last_error_a, starred_a, applied_at_a): (
+                String,
+                Option<i64>,
+                i64,
+                Option<String>,
+                i64,
+                Option<i64>,
+            ) = conn
+                .query_row(
+                    "SELECT status, scanned_at, attempts, last_error, starred, applied_at FROM jobs WHERE simplify_id = 'a'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .unwrap();
+            assert_eq!(status_a, "pending");
+            assert_eq!(scanned_at_a, None);
+            assert_eq!(attempts_a, 2);
+            assert_eq!(last_error_a.as_deref(), Some("legacy err"));
+            assert_eq!(starred_a, 1);
+            assert_eq!(applied_at_a, Some(9999));
+
+            let (status_b, scanned_at_b): (String, Option<i64>) = conn
+                .query_row(
+                    "SELECT status, scanned_at FROM jobs WHERE simplify_id = 'b'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status_b, "unreadable");
+            assert_eq!(scanned_at_b, Some(123));
+
+            let (status_c, scanned_at_c): (String, Option<i64>) = conn
+                .query_row(
+                    "SELECT status, scanned_at FROM jobs WHERE simplify_id = 'c'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status_c, "rules_done");
+            assert_eq!(scanned_at_c, None);
+
+            let (status_d, scanned_at_d): (String, Option<i64>) = conn
+                .query_row(
+                    "SELECT status, scanned_at FROM jobs WHERE simplify_id = 'd'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status_d, "error");
+            assert_eq!(scanned_at_d, None);
+
+            let (status_e, scanned_at_e): (String, Option<i64>) = conn
+                .query_row(
+                    "SELECT status, scanned_at FROM jobs WHERE simplify_id = 'e'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(status_e, "gone");
+            assert_eq!(scanned_at_e, None);
+        }
+
+        // Second re-open: idempotent, changes nothing more
+        {
+            let conn2 = open(&db_path).unwrap();
+            let status_a: String = conn2
+                .query_row(
+                    "SELECT status FROM jobs WHERE simplify_id = 'a'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status_a, "pending");
+
+            let status_b: String = conn2
+                .query_row(
+                    "SELECT status FROM jobs WHERE simplify_id = 'b'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status_b, "unreadable");
+
+            let status_c: String = conn2
+                .query_row(
+                    "SELECT status FROM jobs WHERE simplify_id = 'c'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(status_c, "rules_done");
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
