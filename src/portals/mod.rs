@@ -10,6 +10,7 @@ pub mod oracle;
 pub mod ultipro;
 pub mod workable;
 pub mod workday;
+pub mod workable;
 
 use std::time::Duration;
 use crate::model::{Fetched, Job, Provider};
