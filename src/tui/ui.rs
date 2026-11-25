@@ -1,7 +1,8 @@
-use crate::model::{Citizenship, ClassYears, Experience, Gpa, Source, Sponsorship};
+use crate::llm::format_class_years;
+use crate::model::{Citizenship, ClassYears, Evidence, Experience, Gpa, Source, Sponsorship};
 use crate::text::truncate_chars;
 use crate::tui::app::{App, Line as DisplayLine};
-use crate::verdict::Verdict;
+use crate::verdict::{Judgement, Verdict};
 use crate::views::{self, tab_count, LocRow, Tab, VerdictFilter};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -180,8 +181,25 @@ pub fn scroll_offset(prev: usize, selected: usize, visible: usize, total: usize)
     offset.min(total.saturating_sub(visible))
 }
 
+fn format_llm_cell(hint: Option<&Judgement>) -> Span<'static> {
+    match hint {
+        Some(h) => {
+            let (str_val, color) = match h.verdict {
+                Verdict::Apply => ("apply", Color::Green),
+                Verdict::Maybe => ("maybe", Color::Yellow),
+                Verdict::No => ("no", Color::Red),
+            };
+            Span::styled(
+                str_val,
+                Style::default().fg(color).add_modifier(Modifier::DIM),
+            )
+        }
+        None => Span::raw(""),
+    }
+}
+
 fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine]) {
-    let header_cells = ["MARK", "VERDICT", "YEAR", "COMPANY", "TITLE", "REASON"]
+    let header_cells = ["MARK", "VERDICT", "LLM", "YEAR", "COMPANY", "TITLE", "REASON"]
         .into_iter()
         .map(|h| Span::styled(h, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
     let header = TableRow::new(header_cells).bottom_margin(0);
@@ -213,6 +231,8 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                     Verdict::No => ("no", Color::Red),
                 };
 
+                let llm_span = format_llm_cell(newest.hint.as_ref());
+
                 let year_str = if newest.judgement.year_confirmed {
                     "yes"
                 } else {
@@ -238,6 +258,7 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                 TableRow::new(vec![
                     mark_cell,
                     verdict_span.into(),
+                    llm_span.into(),
                     year_span.into(),
                     company_span.into(),
                     title_span.into(),
@@ -250,6 +271,7 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                 let mark_cell = format_mark_cell(m.starred, m.applied_at.is_some(), loc_row.is_new(), loc_row.is_closed());
 
                 let verdict_span = Span::raw("");
+                let llm_span = Span::raw("");
                 let year_span = Span::raw("");
                 let company_span = Span::raw("");
                 let title_span = Span::styled(truncate_chars(&format!("└ {}", loc_row.label()), 35), Style::default().fg(Color::White));
@@ -258,6 +280,7 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                 TableRow::new(vec![
                     mark_cell,
                     verdict_span.into(),
+                    llm_span.into(),
                     year_span.into(),
                     company_span.into(),
                     title_span.into(),
@@ -281,6 +304,8 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                     Verdict::No => ("no", Color::Red),
                 };
 
+                let llm_span = format_llm_cell(newest.hint.as_ref());
+
                 let year_str = if newest.judgement.year_confirmed {
                     "yes"
                 } else {
@@ -302,6 +327,7 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                 TableRow::new(vec![
                     mark_cell,
                     verdict_span.into(),
+                    llm_span.into(),
                     year_span.into(),
                     company_span.into(),
                     title_span.into(),
@@ -314,6 +340,7 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
     let widths = [
         Constraint::Length(4),       // MARK
         Constraint::Length(8),       // VERDICT
+        Constraint::Length(6),       // LLM
         Constraint::Length(6),       // YEAR
         Constraint::Length(22),      // COMPANY
         Constraint::Length(37),      // TITLE
@@ -362,7 +389,7 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine]
                 Verdict::No => ("no", Color::Red),
             };
 
-            let title_line = Line::from(vec![
+            let mut title_spans = vec![
                 Span::raw(" "),
                 Span::styled(
                     format!("{} — {}", newest.row.job.company, newest.row.job.title),
@@ -374,7 +401,19 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine]
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(verdict_str, Style::default().fg(verdict_color)),
-            ]);
+            ];
+            if let Some(ref hint) = newest.hint {
+                let word = match hint.verdict {
+                    Verdict::Apply => "apply",
+                    Verdict::Maybe => "maybe",
+                    Verdict::No => "no",
+                };
+                title_spans.push(Span::styled(
+                    format!(" · LLM says: {word}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            let title_line = Line::from(title_spans);
 
             let mut lines = vec![title_line];
 
@@ -442,11 +481,29 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine]
     }
 }
 
+fn format_llm_fact_evidence(val: &str, ev: Option<&Evidence>) -> String {
+    if let Some(e) = ev {
+        format!(r#"LLM: {val} "{}""#, truncate_chars(&e.snippet, 60))
+    } else {
+        format!("LLM: {val}")
+    }
+}
+
 fn render_loc_row_detail(frame: &mut Frame, area: Rect, block: Block, loc_row: &LocRow) {
     let newest = loc_row.newest();
     let posted_str = format_unix_date(newest.row.date_posted);
     let provider_str = newest.row.job.provider.as_str();
     let status_str = newest.row.status.as_str();
+
+    let mut meta = format!("posted {posted_str} · {provider_str} · {status_str}");
+    if let Some(ref hint) = newest.hint {
+        let word = match hint.verdict {
+            Verdict::Apply => "apply",
+            Verdict::Maybe => "maybe",
+            Verdict::No => "no",
+        };
+        meta.push_str(&format!(" · LLM says: {word}"));
+    }
 
     let title_line = Line::from(vec![
         Span::raw(" "),
@@ -455,13 +512,10 @@ fn render_loc_row_detail(frame: &mut Frame, area: Rect, block: Block, loc_row: &
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
-        Span::styled(
-            format!("posted {posted_str} · {provider_str} · {status_str}"),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(meta, Style::default().fg(Color::DarkGray)),
     ]);
 
-    let format_fact_line = |name: &'static str, val: &str, ev: Option<(&str, &str)>| -> Line<'static> {
+    let format_fact_line = |name: &'static str, val: &str, ev: Option<(&str, &str)>, llm_ev: Option<String>| -> Line<'static> {
         let mut spans = vec![
             Span::raw(" "),
             Span::styled(format!("{:<13}", name), Style::default().fg(Color::Cyan)),
@@ -471,6 +525,11 @@ fn render_loc_row_detail(frame: &mut Frame, area: Rect, block: Block, loc_row: &
             spans.push(Span::styled(
                 format!("{}: \"{}\"", src, truncate_chars(snippet, 80)),
                 Style::default().fg(Color::DarkGray),
+            ));
+        } else if let Some(llm_text) = llm_ev {
+            spans.push(Span::styled(
+                llm_text,
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
             ));
         }
         Line::from(spans)
@@ -495,7 +554,21 @@ fn render_loc_row_detail(frame: &mut Frame, area: Rect, block: Block, loc_row: &
             Sponsorship::Unknown => "unknown",
         };
         let sp_ev = f.sponsorship.evidence.as_ref().map(|e| (source_str(e.source), e.snippet.as_str()));
-        lines.push(format_fact_line("sponsorship", sp_val, sp_ev));
+        let sp_llm = if matches!(f.sponsorship.value, Sponsorship::Unknown) {
+            newest.row.llm_facts.as_ref().and_then(|llm| {
+                let val_str = match llm.sponsorship.value {
+                    Sponsorship::Offered => "offered",
+                    Sponsorship::NotOffered => "not_offered",
+                    Sponsorship::Asked => "asked",
+                    Sponsorship::NotMentioned => "not_mentioned",
+                    Sponsorship::Unknown => return None,
+                };
+                Some(format_llm_fact_evidence(val_str, llm.sponsorship.evidence.as_ref()))
+            })
+        } else {
+            None
+        };
+        lines.push(format_fact_line("sponsorship", sp_val, sp_ev, sp_llm));
 
         // citizenship
         let cit_val = match f.citizenship.value {
@@ -504,7 +577,19 @@ fn render_loc_row_detail(frame: &mut Frame, area: Rect, block: Block, loc_row: &
             Citizenship::Unknown => "unknown",
         };
         let cit_ev = f.citizenship.evidence.as_ref().map(|e| (source_str(e.source), e.snippet.as_str()));
-        lines.push(format_fact_line("citizenship", cit_val, cit_ev));
+        let cit_llm = if matches!(f.citizenship.value, Citizenship::Unknown) {
+            newest.row.llm_facts.as_ref().and_then(|llm| {
+                let val_str = match llm.citizenship.value {
+                    Citizenship::Required => "required",
+                    Citizenship::NotMentioned => "not_mentioned",
+                    Citizenship::Unknown => return None,
+                };
+                Some(format_llm_fact_evidence(val_str, llm.citizenship.evidence.as_ref()))
+            })
+        } else {
+            None
+        };
+        lines.push(format_fact_line("citizenship", cit_val, cit_ev, cit_llm));
 
         // gpa
         let gpa_val = match f.gpa.value {
@@ -514,7 +599,20 @@ fn render_loc_row_detail(frame: &mut Frame, area: Rect, block: Block, loc_row: &
             Gpa::Unknown => "unknown".to_string(),
         };
         let gpa_ev = f.gpa.evidence.as_ref().map(|e| (source_str(e.source), e.snippet.as_str()));
-        lines.push(format_fact_line("gpa", &gpa_val, gpa_ev));
+        let gpa_llm = if matches!(f.gpa.value, Gpa::Unknown) {
+            newest.row.llm_facts.as_ref().and_then(|llm| {
+                let val_str = match &llm.gpa.value {
+                    Gpa::Min(m) => format!("min {m}"),
+                    Gpa::Asked => "asked".to_string(),
+                    Gpa::NotMentioned => "not_mentioned".to_string(),
+                    Gpa::Unknown => return None,
+                };
+                Some(format_llm_fact_evidence(&val_str, llm.gpa.evidence.as_ref()))
+            })
+        } else {
+            None
+        };
+        lines.push(format_fact_line("gpa", &gpa_val, gpa_ev, gpa_llm));
 
         // experience
         let exp_val = match f.experience.value {
@@ -524,7 +622,20 @@ fn render_loc_row_detail(frame: &mut Frame, area: Rect, block: Block, loc_row: &
             Experience::Unknown => "unknown",
         };
         let exp_ev = f.experience.evidence.as_ref().map(|e| (source_str(e.source), e.snippet.as_str()));
-        lines.push(format_fact_line("experience", exp_val, exp_ev));
+        let exp_llm = if matches!(f.experience.value, Experience::Unknown) {
+            newest.row.llm_facts.as_ref().and_then(|llm| {
+                let val_str = match llm.experience.value {
+                    Experience::Required => "required",
+                    Experience::Preferred => "preferred",
+                    Experience::NotMentioned => "not_mentioned",
+                    Experience::Unknown => return None,
+                };
+                Some(format_llm_fact_evidence(val_str, llm.experience.evidence.as_ref()))
+            })
+        } else {
+            None
+        };
+        lines.push(format_fact_line("experience", exp_val, exp_ev, exp_llm));
 
         // class years
         let cy_val = match &f.class_years.value {
@@ -536,7 +647,19 @@ fn render_loc_row_detail(frame: &mut Frame, area: Rect, block: Block, loc_row: &
             ClassYears::Unknown => "unknown".to_string(),
         };
         let cy_ev = f.class_years.evidence.as_ref().map(|e| (source_str(e.source), e.snippet.as_str()));
-        lines.push(format_fact_line("class years", &cy_val, cy_ev));
+        let cy_llm = if matches!(f.class_years.value, ClassYears::Unknown) {
+            newest.row.llm_facts.as_ref().and_then(|llm| {
+                let val_str = match &llm.class_years.value {
+                    ClassYears::Grad(years) => format_class_years(years),
+                    ClassYears::Any => "any".to_string(),
+                    ClassYears::Unknown => return None,
+                };
+                Some(format_llm_fact_evidence(&val_str, llm.class_years.evidence.as_ref()))
+            })
+        } else {
+            None
+        };
+        lines.push(format_fact_line("class years", &cy_val, cy_ev, cy_llm));
     } else {
         lines.push(Line::from(vec![Span::raw(" (no facts scanned)")]));
     }
@@ -919,5 +1042,292 @@ mod tests {
         terminal.draw(|f| render(f, &app)).unwrap();
         let buffer_str = buffer_to_string(terminal.backend().buffer());
         assert!(buffer_str.contains("✗"));
+    }
+
+    fn make_row_with_llm(
+        id: i64,
+        company: &str,
+        title: &str,
+        active: bool,
+        marks: Marks,
+        facts: Option<Facts>,
+        llm_facts: Option<Facts>,
+        locations: Vec<String>,
+        date_posted: i64,
+    ) -> Row {
+        Row {
+            job: Job {
+                id,
+                simplify_id: format!("job_{id}"),
+                company: company.to_string(),
+                title: title.to_string(),
+                url: format!("https://example.com/job/{id}"),
+                provider: Provider::Other,
+            },
+            status: Status::RulesDone,
+            facts,
+            llm_facts,
+            date_posted,
+            active,
+            marks,
+            is_new: false,
+            locations,
+            asks_location: false,
+        }
+    }
+
+    #[test]
+    fn table_shows_llm_column() {
+        let mut years = std::collections::BTreeSet::new();
+        years.insert(2027);
+        years.insert(2028);
+
+        let mut rules_facts = clean_facts();
+        rules_facts.class_years = Fact {
+            value: ClassYears::Unknown,
+            evidence: None,
+        };
+
+        let mut llm_facts = Facts::unknown();
+        llm_facts.class_years = Fact {
+            value: ClassYears::Grad(years),
+            evidence: Some(crate::model::Evidence {
+                source: Source::Llm,
+                snippet: "rising juniors only".to_string(),
+            }),
+        };
+
+        let r1 = make_row_with_llm(
+            1,
+            "AcmeCorp",
+            "SWE",
+            true,
+            Marks::default(),
+            Some(rules_facts),
+            Some(llm_facts),
+            vec![],
+            200,
+        );
+        let r2 = make_row(2, "BetaCorp", "Dev", true, Marks::default());
+
+        let cfg = test_config();
+        let mut app = App::new(vec![r1, r2], &cfg);
+        app.filter = VerdictFilter::All;
+
+        let backend = TestBackend::new(150, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer_str = buffer_to_string(terminal.backend().buffer());
+
+        let header_line = buffer_str.lines().find(|l| l.contains("VERDICT")).unwrap();
+        let header_chars: Vec<char> = header_line.chars().collect();
+        let v_pos = header_chars.windows(7).position(|w| w == &['V', 'E', 'R', 'D', 'I', 'C', 'T']).unwrap();
+        let l_pos = header_chars.windows(3).position(|w| w == &['L', 'L', 'M']).unwrap();
+        let y_pos = header_chars.windows(4).position(|w| w == &['Y', 'E', 'A', 'R']).unwrap();
+        assert!(v_pos < l_pos && l_pos < y_pos, "LLM column must be between VERDICT and YEAR");
+
+        let r1_line = buffer_str.lines().find(|l| l.contains("AcmeCorp")).unwrap();
+        let r1_chars: Vec<char> = r1_line.chars().collect();
+        let r1_cell: String = r1_chars[l_pos..l_pos + 4].iter().collect();
+        assert!(r1_cell.starts_with("no"), "r1 LLM cell should start with 'no', got '{r1_cell}'");
+
+        let r2_line = buffer_str.lines().find(|l| l.contains("BetaCorp")).unwrap();
+        let r2_chars: Vec<char> = r2_line.chars().collect();
+        let r2_cell: String = r2_chars[l_pos..l_pos + 4].iter().collect();
+        assert_eq!(r2_cell.trim(), "", "r2 LLM cell should be blank, got '{r2_cell}'");
+    }
+
+    #[test]
+    fn group_header_llm_cell() {
+        let mut years = std::collections::BTreeSet::new();
+        years.insert(2027);
+        years.insert(2028);
+
+        let mut rules_facts = clean_facts();
+        rules_facts.class_years = Fact {
+            value: ClassYears::Unknown,
+            evidence: None,
+        };
+
+        let mut llm_facts = Facts::unknown();
+        llm_facts.class_years = Fact {
+            value: ClassYears::Grad(years),
+            evidence: Some(crate::model::Evidence {
+                source: Source::Llm,
+                snippet: "rising juniors only".to_string(),
+            }),
+        };
+
+        let r1 = make_row_with_llm(
+            1,
+            "Acme",
+            "SWE",
+            true,
+            Marks::default(),
+            Some(rules_facts.clone()),
+            Some(llm_facts),
+            vec!["SF".into()],
+            200,
+        );
+        let r2 = make_row_with_llm(
+            2,
+            "Acme",
+            "SWE",
+            true,
+            Marks::default(),
+            Some(rules_facts),
+            None,
+            vec!["NYC".into()],
+            100,
+        );
+
+        let cfg = test_config();
+        let mut app = App::new(vec![r1, r2], &cfg);
+        app.filter = VerdictFilter::All;
+
+        let backend = TestBackend::new(150, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer_str = buffer_to_string(terminal.backend().buffer());
+
+        let header_line = buffer_str.lines().find(|l| l.contains("VERDICT")).unwrap();
+        let header_chars: Vec<char> = header_line.chars().collect();
+        let l_pos = header_chars.windows(3).position(|w| w == &['L', 'L', 'M']).unwrap();
+
+        let group_line = buffer_str.lines().find(|l| l.contains("Acme") && l.contains("×2")).unwrap();
+        let group_chars: Vec<char> = group_line.chars().collect();
+        let group_cell: String = group_chars[l_pos..l_pos + 4].iter().collect();
+        assert!(group_cell.starts_with("no"), "Group header LLM cell should show top row's hint 'no', got '{group_cell}'");
+    }
+
+    #[test]
+    fn child_row_llm_cell_blank() {
+        let mut years = std::collections::BTreeSet::new();
+        years.insert(2027);
+        years.insert(2028);
+
+        let mut rules_facts = clean_facts();
+        rules_facts.class_years = Fact {
+            value: ClassYears::Unknown,
+            evidence: None,
+        };
+
+        let mut llm_facts = Facts::unknown();
+        llm_facts.class_years = Fact {
+            value: ClassYears::Grad(years),
+            evidence: Some(crate::model::Evidence {
+                source: Source::Llm,
+                snippet: "rising juniors only".to_string(),
+            }),
+        };
+
+        let r1 = make_row_with_llm(
+            1,
+            "Acme",
+            "SWE",
+            true,
+            Marks::default(),
+            Some(rules_facts.clone()),
+            Some(llm_facts),
+            vec!["SF".into()],
+            200,
+        );
+        let r2 = make_row_with_llm(
+            2,
+            "Acme",
+            "SWE",
+            true,
+            Marks::default(),
+            Some(rules_facts),
+            None,
+            vec!["NYC".into()],
+            100,
+        );
+
+        let cfg = test_config();
+        let mut app = App::new(vec![r1, r2], &cfg);
+        app.filter = VerdictFilter::All;
+
+        app.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Enter,
+            ratatui::crossterm::event::KeyModifiers::empty(),
+        ));
+
+        let backend = TestBackend::new(150, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer_str = buffer_to_string(terminal.backend().buffer());
+
+        let header_line = buffer_str.lines().find(|l| l.contains("VERDICT")).unwrap();
+        let header_chars: Vec<char> = header_line.chars().collect();
+        let l_pos = header_chars.windows(3).position(|w| w == &['L', 'L', 'M']).unwrap();
+
+        let child_line = buffer_str.lines().find(|l| l.contains("└ SF")).unwrap();
+        let child_chars: Vec<char> = child_line.chars().collect();
+        let child_cell: String = child_chars[l_pos..l_pos + 4].iter().collect();
+        assert_eq!(child_cell.trim(), "", "Child row LLM cell should be blank, got '{child_cell}'");
+    }
+
+    #[test]
+    fn detail_shows_llm_inline() {
+        let mut years = std::collections::BTreeSet::new();
+        years.insert(2027);
+        years.insert(2028);
+
+        let mut rules_facts = clean_facts();
+        rules_facts.class_years = Fact {
+            value: ClassYears::Unknown,
+            evidence: None,
+        };
+
+        let mut llm_facts = Facts::unknown();
+        llm_facts.class_years = Fact {
+            value: ClassYears::Grad(years),
+            evidence: Some(crate::model::Evidence {
+                source: Source::Llm,
+                snippet: "rising juniors only".to_string(),
+            }),
+        };
+
+        let r1 = make_row_with_llm(
+            1,
+            "AcmeCorp",
+            "SWE",
+            true,
+            Marks::default(),
+            Some(rules_facts),
+            Some(llm_facts),
+            vec!["San Francisco, CA".into()],
+            200,
+        );
+
+        let cfg = test_config();
+        let app = App::new(vec![r1], &cfg);
+        let backend = TestBackend::new(150, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = buffer_to_string(terminal.backend().buffer());
+
+        assert!(buf.contains("LLM says: no"), "Detail title should contain 'LLM says: no'");
+        let cy_line = buf.lines().find(|l| l.contains("class years")).unwrap();
+        assert!(cy_line.contains("unknown"), "Fact value should be unknown");
+        assert!(cy_line.contains("LLM: 2027-2028"), "Fact line should contain 'LLM: 2027-2028'");
+        assert!(cy_line.contains("rising juniors only"), "Fact line should contain quote");
+        assert!(buf.contains("locations: ") && buf.contains("San Francisco, CA"), "Locations line must remain");
+        assert!(buf.contains("https://example.com/job/1"), "URL line must remain");
+    }
+
+    #[test]
+    fn detail_no_hint_unchanged() {
+        let r1 = make_row(1, "AcmeCorp", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let app = App::new(vec![r1], &cfg);
+        let backend = TestBackend::new(150, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buf = buffer_to_string(terminal.backend().buffer());
+
+        assert!(!buf.contains("LLM says:"), "Detail title should not contain 'LLM says:' when no hint");
+        assert!(!buf.contains("LLM:"), "Fact lines should not contain 'LLM:' when no hint");
     }
 }
