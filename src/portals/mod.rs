@@ -4,6 +4,7 @@ pub mod ashby;
 pub mod generic;
 pub mod greenhouse;
 pub mod lever;
+pub mod ultipro;
 pub mod workday;
 
 use std::time::Duration;
@@ -119,7 +120,13 @@ pub async fn fetch(client: &reqwest::Client, job: &Job) -> anyhow::Result<Fetche
             }
         }
         Provider::Lever => lever::fetch(client, job).await,
-        Provider::Other => generic::fetch(client, job).await,
+        Provider::Other => {
+            if ultipro::is_ultipro(&job.url) {
+                ultipro::fetch(client, job).await
+            } else {
+                generic::fetch(client, job).await
+            }
+        }
     }
 }
 
