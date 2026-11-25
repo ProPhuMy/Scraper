@@ -5,7 +5,7 @@ A command-line tool that tells you which software internships you're actually el
 Many job postings never say outright whether they take first-years, need a GPA, sponsor visas or want prior experience. The application form often gives it away, with questions like "Will you require sponsorship?", "What's your GPA?" or a graduation-year dropdown. `scraper` reads the form and the job description for each posting and sorts every job into **apply**, **maybe** or **no**, with the reason.
 
 - Job list: [SimplifyJobs Summer Internships](https://github.com/SimplifyJobs) (filtered to US software/ML/data roles).
-- Application forms read from Greenhouse, Ashby and Lever. Descriptions read from those plus Workday and ordinary job pages.
+- Application forms read from Greenhouse, Ashby, Lever, Workable and BambooHR. Descriptions read from those plus Workday, Oracle Cloud, UltiPro/UKG, and ordinary job pages (including the job data that many JavaScript sites embed).
 - One self-contained binary. Data lives in a local SQLite file.
 
 ## Install
@@ -141,7 +141,7 @@ The LLM is only asked about facts that are still unknown. Answers must quote the
 
 ## Limitations
 
-- Pages that render entirely with JavaScript (for example UltiPro/UKG and Oracle Cloud job boards) can't be read and show up as **maybe**.
+- Sites that block automated requests (iCIMS-hosted boards, Tesla, Meta) and pages that render entirely with JavaScript can't be read and show up as **maybe**.
 - Workday application forms sit behind a login, so for Workday jobs only the description is used.
 - Pattern rules can still misread unusual wording. The reason column always quotes the sentence it used, so check it before you skip a job.
 
