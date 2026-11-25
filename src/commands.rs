@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::db;
 use crate::extract;
 use crate::llm::{LlmClient, LlmOutcome};
-use crate::model::{Fetched, Status};
+use crate::model::{Facts, Fetched, Status};
 use crate::portals;
 use crate::simplify;
 
@@ -98,6 +98,13 @@ pub fn decide_recheck(
     }
 }
 
+pub fn rules_changed(stored: Option<&Facts>, new: &Facts) -> bool {
+    match stored {
+        Some(s) => s != new,
+        None => true,
+    }
+}
+
 pub type Reporter = std::sync::Arc<dyn Fn(Progress) + Send + Sync>;
 
 pub fn format_progress(p: &Progress) -> Option<(bool, String)> {
@@ -154,18 +161,18 @@ pub fn format_progress(p: &Progress) -> Option<(bool, String)> {
             if changes.is_empty() {
                 Some((
                     false,
-                    format!("[LLM {done}/{total}] {company} \u{2014} {title}: no change"),
+                    format!("[LLM {done}/{total}] {company} \u{2014} {title}: no answer"),
                 ))
             } else {
                 let changes_str = changes
                     .iter()
-                    .map(|(k, v)| format!("{k} \u{2192} {v}"))
+                    .map(|(k, v)| format!("{k} {v}"))
                     .collect::<Vec<_>>()
                     .join(", ");
                 Some((
                     false,
                     format!(
-                        "[LLM {done}/{total}] {company} \u{2014} {title}: {changes_str}"
+                        "[LLM {done}/{total}] {company} \u{2014} {title}: LLM says {changes_str}"
                     ),
                 ))
             }
@@ -361,13 +368,8 @@ pub async fn scan_with(
                         }
                         RecheckAction::Save(p) => {
                             let facts = extract::extract(&job.title, &p, season_year);
-                            // Text-only changes ("posted 3 days ago", banners) must not throw away
-                            // LLM answers: only re-save when the rule-extracted facts differ.
-                            let same_facts = old_page
-                                .as_ref()
-                                .map(|old| extract::extract(&job.title, old, season_year) == facts)
-                                .unwrap_or(false);
-                            if same_facts {
+                            let stored = db::stored_facts(&conn, job.id).ok().flatten();
+                            if !rules_changed(stored.as_ref(), &facts) {
                                 let _ = db::touch_scanned(&conn, job.id, now);
                                 conn.query_row("SELECT status FROM jobs WHERE id = ?1", rusqlite::params![job.id], |r| r.get::<_, String>(0))
                                     .ok()
@@ -477,7 +479,7 @@ pub async fn scan_with(
         {
             Ok(LlmOutcome::Facts(f)) => {
                 let conn = db_conn.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = db::save_llm(&conn, job.id, &f) {
+                if let Err(e) = db::save_llm(&conn, job.id, &f.llm_part()) {
                     report(Progress::LlmSaveError {
                         job_id: job.id,
                         error: format!("{e:#}"),
@@ -529,7 +531,7 @@ pub async fn scan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Citizenship, Gpa, Sponsorship};
+    use crate::model::{Citizenship, Facts, Gpa, Sponsorship};
 
     #[test]
     fn host_of_cases() {
@@ -653,15 +655,31 @@ mod tests {
         );
         assert_eq!(
             format_progress(&Progress::LlmSettled {
-                done: 3,
-                total: 5,
-                company: "CornerStone Partners".into(),
-                title: "AI and Automation Intern".into(),
-                changes: vec![("class_years".into(), "any".into())],
+                done: 1,
+                total: 2,
+                company: "Acme".into(),
+                title: "Intern".into(),
+                changes: vec![
+                    ("class_years".into(), "2027-2028".into()),
+                    ("sponsorship".into(), "not_offered".into()),
+                ],
             }),
             Some((
                 false,
-                "[LLM 3/5] CornerStone Partners \u{2014} AI and Automation Intern: class_years \u{2192} any".into()
+                "[LLM 1/2] Acme \u{2014} Intern: LLM says class_years 2027-2028, sponsorship not_offered".into()
+            ))
+        );
+        assert_eq!(
+            format_progress(&Progress::LlmSettled {
+                done: 1,
+                total: 2,
+                company: "Acme".into(),
+                title: "Intern".into(),
+                changes: vec![],
+            }),
+            Some((
+                false,
+                "[LLM 1/2] Acme \u{2014} Intern: no answer".into()
             ))
         );
         assert_eq!(
@@ -670,11 +688,11 @@ mod tests {
                 total: 5,
                 company: "CornerStone Partners".into(),
                 title: "AI and Automation Intern".into(),
-                changes: vec![],
+                changes: vec![("class_years".into(), "any".into())],
             }),
             Some((
                 false,
-                "[LLM 3/5] CornerStone Partners \u{2014} AI and Automation Intern: no change".into()
+                "[LLM 3/5] CornerStone Partners \u{2014} AI and Automation Intern: LLM says class_years any".into()
             ))
         );
         assert_eq!(
@@ -777,6 +795,16 @@ mod tests {
             decide_recheck(Some(&old_page), &fetched),
             RecheckAction::MarkGone
         );
+    }
+
+    #[test]
+    fn rules_changed_cases() {
+        let f = Facts::unknown();
+        let mut g = Facts::unknown();
+        g.gpa.value = Gpa::Asked;
+        assert!(rules_changed(None, &f));
+        assert!(!rules_changed(Some(&f), &f));
+        assert!(rules_changed(Some(&f), &g));
     }
 
     #[test]
