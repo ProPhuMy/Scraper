@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod ashby;
+pub mod bamboohr;
 pub mod generic;
 pub mod greenhouse;
 pub mod lever;
@@ -119,7 +120,13 @@ pub async fn fetch(client: &reqwest::Client, job: &Job) -> anyhow::Result<Fetche
             }
         }
         Provider::Lever => lever::fetch(client, job).await,
-        Provider::Other => generic::fetch(client, job).await,
+        Provider::Other => {
+            if bamboohr::api_url(&job.url).is_some() {
+                bamboohr::fetch(client, job).await
+            } else {
+                generic::fetch(client, job).await
+            }
+        }
     }
 }
 
