@@ -4,7 +4,10 @@ pub mod ashby;
 pub mod generic;
 pub mod greenhouse;
 pub mod lever;
+pub mod bamboohr;
 pub mod oracle;
+pub mod ultipro;
+pub mod workable;
 pub mod workday;
 
 use std::time::Duration;
@@ -123,6 +126,12 @@ pub async fn fetch(client: &reqwest::Client, job: &Job) -> anyhow::Result<Fetche
         Provider::Other => {
             if oracle::api_url(&job.url).is_some() {
                 oracle::fetch(client, job).await
+            } else if ultipro::is_ultipro(&job.url) {
+                ultipro::fetch(client, job).await
+            } else if bamboohr::api_url(&job.url).is_some() {
+                bamboohr::fetch(client, job).await
+            } else if workable::ids(&job.url).is_some() {
+                workable::fetch(client, job).await
             } else {
                 generic::fetch(client, job).await
             }
