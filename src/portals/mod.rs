@@ -5,6 +5,7 @@ pub mod generic;
 pub mod greenhouse;
 pub mod lever;
 pub mod workday;
+pub mod workable;
 
 use std::time::Duration;
 use crate::model::{Fetched, Job, Provider};
@@ -119,7 +120,13 @@ pub async fn fetch(client: &reqwest::Client, job: &Job) -> anyhow::Result<Fetche
             }
         }
         Provider::Lever => lever::fetch(client, job).await,
-        Provider::Other => generic::fetch(client, job).await,
+        Provider::Other => {
+            if workable::ids(&job.url).is_some() {
+                workable::fetch(client, job).await
+            } else {
+                generic::fetch(client, job).await
+            }
+        }
     }
 }
 
