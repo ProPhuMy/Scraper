@@ -136,7 +136,11 @@ pub fn citizenship(inp: &Input) -> Fact<Citizenship> {
     }
     // Form: question label
     for q in &inp.questions {
-        if is_citizenship_negated(&q.label) {
+        // EEO statements mention "citizenship status" and may end with "acknowledgement required".
+        if is_citizenship_negated(&q.label)
+            || q.label.contains("equal opportunity")
+            || q.label.contains("discriminat")
+        {
             continue;
         }
         if is_public_trust_unknown(&q.label)
@@ -304,7 +308,11 @@ mod tests {
         let page = PortalPage {
             description: "x".repeat(300),
             questions: vec![FormQuestion {
-                label: "do you attest to the following statement? pareto is an equal opportunity employer. pareto does not discriminate in employment on account of race, color, religion, national origin, citizenship status, or veteran status.".into(),
+                label: "Do you attest to the following statement?
+
+Pareto Captive Services (Pareto\") is an equal opportunity employer. Pareto does not discriminate in employment on account of race, color, religion, national origin, citizenship status, ancestry, age, gender, sexual orientation, marital status, physical or mental disability, military status or unfavorable discharge from military service.
+
+I attest with my signature below that I have given to Pareto true and complete information on this application. Electronic acknowledgement required.".into(),
                 options: vec![],
             }],
         };
