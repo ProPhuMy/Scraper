@@ -51,6 +51,11 @@ static HEDGE_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid regex")
 });
 
+static WORK_AUTH_ALTERNATIVE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(aliens?|foreign nationals?|non-?citizens?|individuals?|persons?|others?)\s+(who\s+(is|are)\s+)?(otherwise\s+)?authorized to work\b")
+        .expect("valid regex")
+});
+
 static FORM_CITIZEN_TOPIC_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(citizens?|citizenship|us persons?|permanent residents?)\b").expect("valid regex")
 });
@@ -74,10 +79,11 @@ fn is_public_trust_unknown(text: &str) -> bool {
         && !text.contains("ts-sci")
 }
 
-fn has_non_citizen_alternative(text: &str) -> bool {
+pub(crate) fn has_non_citizen_alternative(text: &str) -> bool {
     text.contains("or able to obtain an export license")
         || text.contains("export license")
         || text.contains("non-us person")
+        || WORK_AUTH_ALTERNATIVE_RE.is_match(text)
 }
 
 fn is_hedge_unknown(text: &str) -> bool {
@@ -255,6 +261,9 @@ mod tests {
             ("- must be a us person due to required access to us export-controlled information or facilities", Required),
             ("clearance required for start: yes", Required),
             ("- active ts/sci clearance", Required),
+            ("All applicants must be a U.S. citizen or national of the U.S., an alien lawfully admitted for permanent residence, or an alien authorized to work in the U.S. for this employer.", Unknown),
+            ("Must be a U.S. citizen or a foreign national authorized to work in the U.S.", Unknown),
+            ("Applicants must be U.S. citizens and authorized to work in the U.S.", Required),
         ];
         for (t, want) in cases {
             assert_eq!(citizenship(&Input::from_text(t)).value, want, "{t}");

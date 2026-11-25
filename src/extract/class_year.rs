@@ -102,7 +102,7 @@ static TITLE_PROGRAM_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static PREFERENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(preferred|preference|preferably|ideally|a plus|desired|nice to have)\b").expect("valid regex")
+    Regex::new(r"\b(preferred|preference|preferably|ideally|a plus|desired|nice to have|typically|usually|generally|encouraged)\b").expect("valid regex")
 });
 
 static OTHER_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -244,12 +244,21 @@ fn extract_standing_years(text: &str, season_year: u16, is_sentence: bool) -> BT
 fn parse_grad_years(text: &str, season_year: u16) -> BTreeSet<u16> {
     let mut years = BTreeSet::new();
 
-    // 1. Remove "summer {S}" and "summer of {S}"
+    // 1. Remove "summer {S}" and "summer of {S}", and two-season ranges ending in {S}
     let summer_pattern = format!(r"\bsummer\s+(?:of\s+)?{}\b", season_year);
     let clean = if let Ok(re) = Regex::new(&summer_pattern) {
         re.replace_all(text, " ").to_string()
     } else {
         text.to_string()
+    };
+    let season_range_pattern = format!(
+        r"\b(spring|summer|fall|autumn|winter)\s*(-|/|and|&|through|to)\s*(spring|summer|fall|autumn|winter)\s+(of\s+)?{}\b",
+        season_year
+    );
+    let clean = if let Ok(re) = Regex::new(&season_range_pattern) {
+        re.replace_all(&clean, " ").to_string()
+    } else {
+        clean
     };
 
     // 2. between Y1 and Y2
@@ -536,8 +545,40 @@ mod tests {
             set(&[2028, 2029])
         );
         assert_eq!(
-            cy("Rising sophomores and juniors are encouraged to apply."),
+            cy("Open to rising sophomores and juniors."),
             set(&[2029, 2030])
+        );
+        assert_eq!(
+            cy("Rising sophomores and juniors are encouraged to apply."),
+            ClassYears::Unknown
+        );
+        assert_eq!(
+            cy("Successful applicants will typically be third or fourth year undergraduate students, graduate students, or recent graduates, and will be asked to complete a technical assessment in order to show competence in C++, Java, or JavaScript."),
+            ClassYears::Unknown
+        );
+        assert_eq!(
+            cy("Rising seniors majoring in computer science, computer engineering, or a related field with strong academic performance are encouraged to apply."),
+            ClassYears::Unknown
+        );
+        assert_eq!(
+            cy("Open to rising seniors. Juniors are encouraged to apply."),
+            set(&[2028])
+        );
+        assert_eq!(
+            cy("This graduate internship is a full-time position summer-fall 2027 (May or June through December) on site in Rochester, Minnesota."),
+            ClassYears::Unknown
+        );
+        assert_eq!(
+            cy("Expected graduation date: spring 2028."),
+            set(&[2028])
+        );
+        assert_eq!(
+            cy("Graduating fall 2027 or spring 2028."),
+            set(&[2027, 2028])
+        );
+        assert_eq!(
+            cy("Internship runs summer/fall 2027 for students graduating in 2029."),
+            set(&[2029])
         );
         assert_eq!(
             cy("Rising Junior, Senior, or Master's student preferred."),

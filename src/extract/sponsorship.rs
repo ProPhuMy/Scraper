@@ -82,6 +82,7 @@ pub fn sponsorship(inp: &Input) -> Fact<Sponsorship> {
             && CPT_OPT_REFUSED_RE.is_match(sent)
             && !has_cpt_opt_offered(sent);
         let citizens_only = !sent.contains("not only")
+            && !crate::extract::citizenship::has_non_citizen_alternative(sent)
             && (CITIZENS_ONLY_RE.is_match(sent) || MUST_BE_CITIZEN_RE.is_match(sent));
         let sponsor_future_without = sent.contains("sponsor")
             && SPONSOR_FUTURE_WITHOUT_RE.is_match(sent)
@@ -209,6 +210,7 @@ mod tests {
             ("Opt-in to receive SMS updates.", NotMentioned),
             ("We build robots.", NotMentioned),
             ("Our sponsorship of open source is legendary.", Unknown),
+            ("All applicants must be a U.S. citizen or national of the U.S., an alien lawfully admitted for permanent residence, or an alien authorized to work in the U.S. for this employer.", NotMentioned),
         ];
         for (t, want) in cases {
             assert_eq!(sponsorship(&Input::from_text(t)).value, want, "{t}");
