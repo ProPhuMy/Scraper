@@ -1,4 +1,4 @@
-# scraper
+# Scraper
 
 A command-line tool that tells you which software internships you're actually eligible for.
 
