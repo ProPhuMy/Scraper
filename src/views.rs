@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::config::Profile;
 use crate::db::{Marks, Row};
 use crate::model::Status;
-use crate::verdict::{judge, Judgement, Verdict};
+use crate::verdict::{judge, llm_hint, Judgement, Verdict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -79,6 +79,19 @@ pub fn toggle(mut marks: Marks, key: MarkKey, now: i64) -> Result<Marks, &'stati
 pub struct ViewRow<'a> {
     pub row: &'a Row,
     pub judgement: Judgement,
+    pub hint: Option<Judgement>,
+}
+
+pub fn llm_rank(vr: &ViewRow) -> u8 {
+    if vr.judgement.verdict != Verdict::Maybe {
+        return 0;
+    }
+    match vr.hint.as_ref().map(|h| h.verdict) {
+        Some(Verdict::Apply) => 0,
+        Some(Verdict::Maybe) => 1,
+        Some(Verdict::No) => 2,
+        None => 3,
+    }
 }
 
 pub fn build_view<'a>(
@@ -105,7 +118,8 @@ pub fn build_view<'a>(
         })
         .map(|row| {
             let judgement = judge(row.status, row.facts.as_ref(), profile, season_year);
-            ViewRow { row, judgement }
+            let hint = llm_hint(row, profile, season_year);
+            ViewRow { row, judgement, hint }
         })
         .filter(|vr| {
             if tab == Tab::Jobs {
@@ -131,6 +145,7 @@ pub fn build_view<'a>(
             (
                 !vr.row.marks.starred,
                 vr.judgement.verdict,
+                llm_rank(vr),
                 std::cmp::Reverse(vr.row.date_posted),
             )
         });
@@ -1164,18 +1179,84 @@ mod tests {
 
         let loc_mixed = LocRow {
             members: vec![
-                ViewRow { row: &row_gone, judgement: j_gone.clone() },
-                ViewRow { row: &row_open, judgement: j_open },
+                ViewRow { row: &row_gone, judgement: j_gone.clone(), hint: None },
+                ViewRow { row: &row_open, judgement: j_open, hint: None },
             ],
         };
         assert_eq!(loc_mixed.is_closed(), false);
 
         let loc_all_closed = LocRow {
             members: vec![
-                ViewRow { row: &row_gone, judgement: j_gone },
-                ViewRow { row: &row_inactive, judgement: j_inactive },
+                ViewRow { row: &row_gone, judgement: j_gone, hint: None },
+                ViewRow { row: &row_inactive, judgement: j_inactive, hint: None },
             ],
         };
         assert_eq!(loc_all_closed.is_closed(), true);
+    }
+
+    #[test]
+    fn maybe_sorted_by_llm_hint() {
+        let p = test_profile(); // grad year 2030, season 2027
+
+        // 1 apply row
+        let row_apply = make_row(0, "ApplyCorp", "SWE", true, Marks::default(), Status::RulesDone, Some(clean_facts()), 1000);
+
+        // 4 maybe rows
+        // Apply hint:
+        let mut facts_maybe_sp = clean_facts();
+        facts_maybe_sp.sponsorship.value = Sponsorship::Unknown;
+        let mut llm_sp_offered = Facts::unknown();
+        llm_sp_offered.sponsorship = Fact {
+            value: Sponsorship::Offered,
+            evidence: Some(crate::model::Evidence {
+                source: crate::model::Source::Llm,
+                snippet: "sponsorship offered".to_string(),
+            }),
+        };
+        let mut row_hint_apply = make_row(1, "HintApply", "SWE", true, Marks::default(), Status::RulesDone, Some(facts_maybe_sp.clone()), 1000);
+        row_hint_apply.llm_facts = Some(llm_sp_offered);
+
+        // No hint:
+        let mut facts_maybe_cy = clean_facts();
+        facts_maybe_cy.class_years.value = ClassYears::Unknown;
+        let mut llm_cy_no = Facts::unknown();
+        let mut years = BTreeSet::new();
+        years.insert(2027);
+        years.insert(2028);
+        llm_cy_no.class_years = Fact {
+            value: ClassYears::Grad(years),
+            evidence: Some(crate::model::Evidence {
+                source: crate::model::Source::Llm,
+                snippet: "2027 or 2028".to_string(),
+            }),
+        };
+        let mut row_hint_no = make_row(2, "HintNo", "SWE", true, Marks::default(), Status::RulesDone, Some(facts_maybe_cy), 1000);
+        row_hint_no.llm_facts = Some(llm_cy_no);
+
+        // None hint:
+        let row_hint_none = make_row(3, "HintNone", "SWE", true, Marks::default(), Status::RulesDone, Some(facts_maybe_sp.clone()), 1000);
+
+        // Maybe hint:
+        let mut facts_maybe_two = clean_facts();
+        facts_maybe_two.sponsorship.value = Sponsorship::Unknown;
+        facts_maybe_two.gpa.value = Gpa::Unknown;
+        let mut llm_sp_only = Facts::unknown();
+        llm_sp_only.sponsorship = Fact {
+            value: Sponsorship::Offered,
+            evidence: Some(crate::model::Evidence {
+                source: crate::model::Source::Llm,
+                snippet: "sponsorship offered".to_string(),
+            }),
+        };
+        let mut row_hint_maybe = make_row(4, "HintMaybe", "SWE", true, Marks::default(), Status::RulesDone, Some(facts_maybe_two), 1000);
+        row_hint_maybe.llm_facts = Some(llm_sp_only);
+
+        // Input order: Apply (0), hint Apply (1), hint No (2), hint None (3), hint Maybe (4)
+        let rows = [row_apply, row_hint_apply, row_hint_no, row_hint_none, row_hint_maybe];
+        let view = build_view(&rows, Tab::Jobs, VerdictFilter::All, "", &p, 2027);
+
+        // Expected sorted order: Apply (0), hint Apply (1), hint Maybe (4), hint No (2), hint None (3)
+        let ids: Vec<i64> = view.iter().map(|vr| vr.row.job.id).collect();
+        assert_eq!(ids, vec![0, 1, 4, 2, 3]);
     }
 }

@@ -207,6 +207,18 @@ pub fn judge(
     }
 }
 
+pub fn llm_hint(row: &db::Row, profile: &Profile, season_year: u16) -> Option<Judgement> {
+    if views::is_closed(row) {
+        return None;
+    }
+    let rules = row.facts.as_ref()?;
+    let llm = row.llm_facts.as_ref()?;
+    if !llm.has_any_known() {
+        return None;
+    }
+    Some(judge(row.status, Some(&rules.overlay(llm)), profile, season_year))
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ListFlags {
     pub all: bool,
@@ -234,8 +246,8 @@ pub fn select_rows<'a>(rows: &'a [db::Row], flags: ListFlags) -> Vec<&'a db::Row
 
 pub fn render_table(view: &[views::ViewRow], color: bool) -> String {
     let header = format!(
-        "{:<4} {:<7} {:<5} {:<20} {:<40} {:<60} {}",
-        "MARK", "VERDICT", "YEAR", "COMPANY", "TITLE", "REASON", "URL"
+        "{:<4} {:<7} {:<5} {:<5} {:<20} {:<40} {:<60} {}",
+        "MARK", "VERDICT", "LLM", "YEAR", "COMPANY", "TITLE", "REASON", "URL"
     );
 
     let mut lines = Vec::with_capacity(view.len() + 1);
@@ -292,6 +304,22 @@ pub fn render_table(view: &[views::ViewRow], color: bool) -> String {
             }
         };
 
+        let formatted_llm = if color {
+            match vr.hint.as_ref().map(|h| h.verdict) {
+                Some(Verdict::Apply) => format!("{}", "apply".green().dim()),
+                Some(Verdict::Maybe) => format!("{}", "maybe".yellow().dim()),
+                Some(Verdict::No) => format!("{}   ", "no".red().dim()),
+                None => format!("{}    ", "-".dim()),
+            }
+        } else {
+            match vr.hint.as_ref().map(|h| h.verdict) {
+                Some(Verdict::Apply) => format!("{:<5}", "apply"),
+                Some(Verdict::Maybe) => format!("{:<5}", "maybe"),
+                Some(Verdict::No) => format!("{:<5}", "no"),
+                None => format!("{:<5}", "-"),
+            }
+        };
+
         let year_str = if vr.judgement.year_confirmed {
             "yes"
         } else {
@@ -306,12 +334,19 @@ pub fn render_table(view: &[views::ViewRow], color: bool) -> String {
         let formatted_reason = format!("{:<60}", trunc_reason);
 
         lines.push(format!(
-            "{formatted_mark} {formatted_verdict} {formatted_year} {formatted_company} {formatted_title} {formatted_reason} {}",
+            "{formatted_mark} {formatted_verdict} {formatted_llm} {formatted_year} {formatted_company} {formatted_title} {formatted_reason} {}",
             vr.row.job.url
         ));
     }
 
     lines.join("\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct JsonLlm<'a> {
+    pub verdict: Verdict,
+    pub reason: String,
+    pub facts: &'a Facts,
 }
 
 #[derive(Serialize)]
@@ -324,6 +359,7 @@ pub struct JsonOutput<'a> {
     pub reason: &'a str,
     pub status: Status,
     pub facts: Option<&'a Facts>,
+    pub llm: Option<JsonLlm<'a>>,
     pub starred: bool,
     pub hidden: bool,
     pub applied_at: Option<i64>,
@@ -392,7 +428,8 @@ pub fn list(
         .into_iter()
         .map(|row| {
             let judgement = judge(row.status, row.facts.as_ref(), &profile, cfg.season_year);
-            views::ViewRow { row, judgement }
+            let hint = llm_hint(row, &profile, cfg.season_year);
+            views::ViewRow { row, judgement, hint }
         })
         .collect();
 
@@ -418,6 +455,7 @@ pub fn list(
             (
                 !vr.row.marks.starred,
                 vr.judgement.verdict,
+                views::llm_rank(vr),
                 std::cmp::Reverse(vr.row.date_posted),
             )
         });
@@ -435,6 +473,13 @@ pub fn list(
                 reason: &vr.judgement.reason,
                 status: vr.row.status,
                 facts: vr.row.facts.as_ref(),
+                llm: vr.hint.as_ref().and_then(|h| {
+                    vr.row.llm_facts.as_ref().map(|f| JsonLlm {
+                        verdict: h.verdict,
+                        reason: h.reason.clone(),
+                        facts: f,
+                    })
+                }),
                 starred: vr.row.marks.starred,
                 hidden: vr.row.marks.hidden,
                 applied_at: vr.row.marks.applied_at,
@@ -444,15 +489,12 @@ pub fn list(
             })
             .collect();
 
-        write_stdout(&format!("{}
-", serde_json::to_string_pretty(&json_items)?))?;
+        write_stdout(&format!("{}\n", serde_json::to_string_pretty(&json_items)?))?;
     } else {
         let color = std::io::stdout().is_terminal()
             && std::env::var_os("NO_COLOR").map_or(true, |v| v.is_empty());
         let table = render_table(&view_rows, color);
-        write_stdout(&format!("{table}
-{a_count} apply, {m_count} maybe, {n_count} no
-"))?;
+        write_stdout(&format!("{table}\n{a_count} apply, {m_count} maybe, {n_count} no\n"))?;
     }
 
     Ok(())
@@ -837,7 +879,7 @@ mod tests {
             reason: "no blockers found".to_string(),
             year_confirmed: true,
         };
-        let view = [crate::views::ViewRow { row: &row, judgement }];
+        let view = [crate::views::ViewRow { row: &row, judgement, hint: None }];
         let out = render_table(&view, false);
         assert!(!out.contains('\x1b'));
         assert!(out.contains("apply"));
@@ -851,7 +893,7 @@ mod tests {
             reason: "no blockers found".to_string(),
             year_confirmed: true,
         };
-        let view = [crate::views::ViewRow { row: &row, judgement }];
+        let view = [crate::views::ViewRow { row: &row, judgement, hint: None }];
         let out = render_table(&view, true);
         assert!(out.contains('\x1b'));
         assert!(out.contains("apply"));
@@ -888,8 +930,8 @@ mod tests {
             year_confirmed: false,
         };
         let view = [
-            crate::views::ViewRow { row: &row1, judgement: j1 },
-            crate::views::ViewRow { row: &row2, judgement: j2 },
+            crate::views::ViewRow { row: &row1, judgement: j1, hint: None },
+            crate::views::ViewRow { row: &row2, judgement: j2, hint: None },
         ];
         let out = render_table(&view, false);
         let lines: Vec<&str> = out.lines().collect();
@@ -990,7 +1032,7 @@ mod tests {
         let flags = ListFlags { applied: true, ..Default::default() };
         let selected = select_rows(&rows, flags);
         let j = judge(selected[0].status, selected[0].facts.as_ref(), &cfg.profile, cfg.season_year);
-        let view_row = crate::views::ViewRow { row: selected[0], judgement: j };
+        let view_row = crate::views::ViewRow { row: selected[0], judgement: j, hint: None };
         let json_val = serde_json::to_value(&JsonOutput {
             verdict: view_row.judgement.verdict,
             year_confirmed: view_row.judgement.year_confirmed,
@@ -1000,6 +1042,7 @@ mod tests {
             reason: &view_row.judgement.reason,
             status: view_row.row.status,
             facts: view_row.row.facts.as_ref(),
+            llm: None,
             starred: view_row.row.marks.starred,
             hidden: view_row.row.marks.hidden,
             applied_at: view_row.row.marks.applied_at,
@@ -1069,7 +1112,7 @@ mod tests {
         let flags = ListFlags { all: true, ..Default::default() };
         let selected = select_rows(&rows, flags);
         let j = judge(selected[0].status, selected[0].facts.as_ref(), &cfg.profile, cfg.season_year);
-        let view_row = crate::views::ViewRow { row: selected[0], judgement: j };
+        let view_row = crate::views::ViewRow { row: selected[0], judgement: j, hint: None };
         let json_val = serde_json::to_value(&JsonOutput {
             verdict: view_row.judgement.verdict,
             year_confirmed: view_row.judgement.year_confirmed,
@@ -1079,6 +1122,7 @@ mod tests {
             reason: &view_row.judgement.reason,
             status: view_row.row.status,
             facts: view_row.row.facts.as_ref(),
+            llm: None,
             starred: view_row.row.marks.starred,
             hidden: view_row.row.marks.hidden,
             applied_at: view_row.row.marks.applied_at,
@@ -1116,7 +1160,7 @@ mod tests {
             reason: "posting closed".to_string(),
             year_confirmed: false,
         };
-        let view = [crate::views::ViewRow { row: &row, judgement: j }];
+        let view = [crate::views::ViewRow { row: &row, judgement: j, hint: None }];
         let out = render_table(&view, false);
         let line = out.lines().nth(1).unwrap();
         assert!(line.starts_with("✓✗"));
@@ -1138,7 +1182,7 @@ mod tests {
             reason: "posting closed".to_string(),
             year_confirmed: false,
         };
-        let view_row = crate::views::ViewRow { row: &row, judgement: j };
+        let view_row = crate::views::ViewRow { row: &row, judgement: j, hint: None };
         let json_val = serde_json::to_value(&JsonOutput {
             verdict: view_row.judgement.verdict,
             year_confirmed: view_row.judgement.year_confirmed,
@@ -1148,6 +1192,7 @@ mod tests {
             reason: &view_row.judgement.reason,
             status: view_row.row.status,
             facts: view_row.row.facts.as_ref(),
+            llm: None,
             starred: view_row.row.marks.starred,
             hidden: view_row.row.marks.hidden,
             applied_at: view_row.row.marks.applied_at,
@@ -1158,5 +1203,189 @@ mod tests {
         .unwrap();
 
         assert_eq!(json_val["closed"], true);
+    }
+
+    #[test]
+    fn llm_hint_cases() {
+        let p = profile(); // class_year 1, expected_graduation None, 2027 season -> grad 2030
+
+        // (a) llm_facts None gives None
+        let mut row_a = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        row_a.facts = Some(Facts::unknown());
+        row_a.llm_facts = None;
+        assert_eq!(llm_hint(&row_a, &p, 2027), None);
+
+        // (b) llm class_years Grad{2027,2028} with rules Unknown gives Some, verdict No
+        let mut row_b = make_test_row(2, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        row_b.facts = Some(Facts::unknown());
+        let mut llm_b = Facts::unknown();
+        let mut years_b = BTreeSet::new();
+        years_b.insert(2027);
+        years_b.insert(2028);
+        llm_b.class_years = Fact {
+            value: ClassYears::Grad(years_b),
+            evidence: Some(Evidence {
+                source: Source::Llm,
+                snippet: "2027-2028 grads".to_string(),
+            }),
+        };
+        row_b.llm_facts = Some(llm_b);
+        let hint_b = llm_hint(&row_b, &p, 2027).expect("expected hint");
+        assert_eq!(hint_b.verdict, Verdict::No);
+        assert_eq!(hint_b.reason, "class years 2027-2028 (you: 2030)");
+
+        // (c) llm citizenship NotMentioned and every other rules fact clear gives Some, verdict Apply
+        let mut row_c = make_test_row(3, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        let mut rules_c = clean();
+        rules_c.citizenship = Fact {
+            value: Citizenship::Unknown,
+            evidence: None,
+        };
+        row_c.facts = Some(rules_c);
+        let mut llm_c = Facts::unknown();
+        llm_c.citizenship = Fact {
+            value: Citizenship::NotMentioned,
+            evidence: Some(Evidence {
+                source: Source::Llm,
+                snippet: "no mention".to_string(),
+            }),
+        };
+        row_c.llm_facts = Some(llm_c);
+        let hint_c = llm_hint(&row_c, &p, 2027).expect("expected hint");
+        assert_eq!(hint_c.verdict, Verdict::Apply);
+        assert_eq!(hint_c.reason, "no blockers found");
+
+        // (d) the same as (b) but active = false gives None
+        let mut row_d = row_b.clone();
+        row_d.active = false;
+        assert_eq!(llm_hint(&row_d, &p, 2027), None);
+
+        // (e) llm_facts = Facts::unknown() gives None
+        let mut row_e = row_b.clone();
+        row_e.llm_facts = Some(Facts::unknown());
+        assert_eq!(llm_hint(&row_e, &p, 2027), None);
+    }
+
+    #[test]
+    fn render_table_llm_column() {
+        let row1 = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        let row2 = make_test_row(2, "Beta", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        let j1 = Judgement {
+            verdict: Verdict::Maybe,
+            reason: "unclear: sponsorship".to_string(),
+            year_confirmed: false,
+        };
+        let j2 = Judgement {
+            verdict: Verdict::Maybe,
+            reason: "unclear: sponsorship".to_string(),
+            year_confirmed: false,
+        };
+        let h1 = Judgement {
+            verdict: Verdict::No,
+            reason: "no sponsorship".to_string(),
+            year_confirmed: false,
+        };
+        let view = [
+            crate::views::ViewRow { row: &row1, judgement: j1, hint: Some(h1) },
+            crate::views::ViewRow { row: &row2, judgement: j2, hint: None },
+        ];
+        let out = render_table(&view, false);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("VERDICT LLM   YEAR"));
+        assert!(lines[1].contains("maybe   no    year?"));
+        assert!(lines[2].contains("maybe   -     year?"));
+    }
+
+    #[test]
+    fn json_has_llm_key() {
+        let mut row_hint = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        let mut llm_facts = Facts::unknown();
+        let mut years = BTreeSet::new();
+        years.insert(2027);
+        years.insert(2028);
+        llm_facts.class_years = Fact {
+            value: ClassYears::Grad(years),
+            evidence: Some(Evidence {
+                source: Source::Llm,
+                snippet: "2027-2028".to_string(),
+            }),
+        };
+        row_hint.llm_facts = Some(llm_facts.clone());
+
+        let j_maybe = Judgement {
+            verdict: Verdict::Maybe,
+            reason: "unclear: class_years".to_string(),
+            year_confirmed: false,
+        };
+        let hint_no = Judgement {
+            verdict: Verdict::No,
+            reason: "class years 2027-2028 (you: 2030)".to_string(),
+            year_confirmed: false,
+        };
+        let vr_hint = crate::views::ViewRow {
+            row: &row_hint,
+            judgement: j_maybe.clone(),
+            hint: Some(hint_no),
+        };
+
+        let json_hint = serde_json::to_value(&JsonOutput {
+            verdict: vr_hint.judgement.verdict,
+            year_confirmed: vr_hint.judgement.year_confirmed,
+            company: &vr_hint.row.job.company,
+            title: &vr_hint.row.job.title,
+            url: &vr_hint.row.job.url,
+            reason: &vr_hint.judgement.reason,
+            status: vr_hint.row.status,
+            facts: vr_hint.row.facts.as_ref(),
+            llm: vr_hint.hint.as_ref().and_then(|h| {
+                vr_hint.row.llm_facts.as_ref().map(|f| JsonLlm {
+                    verdict: h.verdict,
+                    reason: h.reason.clone(),
+                    facts: f,
+                })
+            }),
+            starred: vr_hint.row.marks.starred,
+            hidden: vr_hint.row.marks.hidden,
+            applied_at: vr_hint.row.marks.applied_at,
+            new: vr_hint.row.is_new,
+            locations: &vr_hint.row.locations,
+            closed: views::is_closed(vr_hint.row),
+        }).unwrap();
+
+        assert_eq!(json_hint["llm"]["verdict"], "no");
+        assert_eq!(json_hint["llm"]["reason"], "class years 2027-2028 (you: 2030)");
+        assert!(json_hint["llm"]["facts"]["class_years"].is_object());
+
+        let row_none = make_test_row(2, "Beta", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        let vr_none = crate::views::ViewRow {
+            row: &row_none,
+            judgement: j_maybe,
+            hint: None,
+        };
+        let json_none = serde_json::to_value(&JsonOutput {
+            verdict: vr_none.judgement.verdict,
+            year_confirmed: vr_none.judgement.year_confirmed,
+            company: &vr_none.row.job.company,
+            title: &vr_none.row.job.title,
+            url: &vr_none.row.job.url,
+            reason: &vr_none.judgement.reason,
+            status: vr_none.row.status,
+            facts: vr_none.row.facts.as_ref(),
+            llm: vr_none.hint.as_ref().and_then(|h| {
+                vr_none.row.llm_facts.as_ref().map(|f| JsonLlm {
+                    verdict: h.verdict,
+                    reason: h.reason.clone(),
+                    facts: f,
+                })
+            }),
+            starred: vr_none.row.marks.starred,
+            hidden: vr_none.row.marks.hidden,
+            applied_at: vr_none.row.marks.applied_at,
+            new: vr_none.row.is_new,
+            locations: &vr_none.row.locations,
+            closed: views::is_closed(vr_none.row),
+        }).unwrap();
+
+        assert!(json_none["llm"].is_null());
     }
 }
