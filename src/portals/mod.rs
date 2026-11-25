@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod ashby;
+pub mod bamboohr;
 pub mod generic;
 pub mod greenhouse;
 pub mod lever;
