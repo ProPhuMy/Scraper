@@ -183,6 +183,11 @@ static CLASS_YEARS_BLOCKING_RE: std::sync::LazyLock<regex::Regex> = std::sync::L
         .expect("valid regex")
 });
 
+static CITIZENSHIP_BLOCKING_REQ_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\b(must|required|requires|require|only|limited to|clearance|itar)\b")
+        .expect("valid regex")
+});
+
 pub fn blocking_evidence_ok(fact: &str, value: &str, evidence: &str) -> bool {
     let norm = crate::text::normalize(evidence);
     match fact {
@@ -195,14 +200,19 @@ pub fn blocking_evidence_ok(fact: &str, value: &str, evidence: &str) -> bool {
         }
         "citizenship" => {
             if value == "required" {
-                norm.contains("citizen")
+                let has_keyword = norm.contains("citizen")
                     || norm.contains("clearance")
                     || norm.contains("us person")
                     || norm.contains("u.s. person")
                     || norm.contains("permanent resident")
                     || norm.contains("green card")
                     || norm.contains("itar")
-                    || norm.contains("export")
+                    || norm.contains("export");
+                if !has_keyword {
+                    return false;
+                }
+                let cleaned = norm.replace("information is required", " ");
+                CITIZENSHIP_BLOCKING_REQ_RE.is_match(&cleaned)
             } else {
                 true
             }
@@ -447,7 +457,7 @@ Allowed values:
 - class_years: an array of accepted graduation years (integers) ONLY if the posting names graduation years, \"class of\" years, or class standings (freshman/sophomore/junior/senior, first-year, rising ...). The internship is in summer {S}. A current freshman graduates {S+3}, sophomore {S+2}, junior {S+1}. \"Current students\", \"enrolled in a degree program\" or \"undergraduates\" alone means \"any\". Else \"unknown\".
 - gpa: a number (the required minimum), \"asked\", \"not_mentioned\", or \"unknown\".
 - sponsorship: \"not_offered\" ONLY if the posting refuses CPT/OPT, is limited to US citizens/permanent residents, or requires no sponsorship now or in the future. Plain \"we do not sponsor visas\" or a question asking about sponsorship is \"asked\". \"offered\" if sponsorship or CPT/OPT is explicitly welcome. Else \"not_mentioned\" or \"unknown\".
-- citizenship: \"required\" if US citizenship, US person status, or a security clearance is required or asked for. Else \"not_mentioned\" or \"unknown\". Ignore equal-opportunity boilerplate and \"authorized to work in the US\" questions.
+- citizenship: \"required\" ONLY if the posting states US citizenship, US person status, or a security clearance is required; a form question that merely asks about citizenship, nationality or status (export-control or I-9 paperwork) is \"unknown\". Else \"not_mentioned\" or \"unknown\". Ignore equal-opportunity boilerplate and \"authorized to work in the US\" questions.
 - experience: \"required\" if prior internship/work experience is required, \"preferred\" if it is a plus. Skills like \"experience with Python\" do not count. Else \"not_mentioned\" or \"unknown\".";
 
 static OPT_RE: std::sync::LazyLock<regex::Regex> =
@@ -1730,6 +1740,10 @@ mod tests {
         assert!(blocking_evidence_ok("experience", "preferred", excel_ev));
 
         // citizenship required
+        assert!(!blocking_evidence_ok("citizenship", "required", "Are you a U.S. citizen, a lawful permanent resident of the United States, an asylee, a refugee?"));
+        assert!(!blocking_evidence_ok("citizenship", "required", "Are you a US citizen? Note: this information is required by federal, state, or local government contracts."));
+        assert!(blocking_evidence_ok("citizenship", "required", "Must be a U.S. citizen."));
+        assert!(blocking_evidence_ok("citizenship", "required", "Do you currently hold an active US security clearance?"));
         assert!(blocking_evidence_ok("citizenship", "required", "must be a \"U.S. Person\" ... includes U.S. citizens"));
         assert!(!blocking_evidence_ok("citizenship", "required", "United States"));
         assert!(blocking_evidence_ok("citizenship", "not_mentioned", "United States"));

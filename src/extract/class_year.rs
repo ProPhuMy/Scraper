@@ -6,7 +6,11 @@ use crate::extract::{ev, Input};
 use crate::model::{ClassYears, Fact, Source};
 
 static RISING_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\brising\s+(freshm[ea]n\w*|sophomore\w*|junior\w*|senior\w*)\b").expect("valid regex")
+    Regex::new(r"(?i)\brising\s+(freshm[ea]n\w*|sophomore\w*|junior\w*|senior\w*)\b").expect("valid regex")
+});
+
+static RISING_NEXT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:\s*,\s*(?:or|and)\s*|\s*,\s*|\s+(?:or|and)\s*|\s*/\s*)(freshm[ea]n\w*|sophomore\w*|junior\w*|senior\w*)\b").expect("valid regex")
 });
 
 static FRESHMAN_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -90,37 +94,96 @@ static EXPLICIT_ANY_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static FORM_QUESTION_LABEL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(graduat|school year|year in school|class standing|academic year|class year)").expect("valid regex")
+    Regex::new(r"\b(graduat|school year|year in school|class standing|academic standing|academic year|class year)").expect("valid regex")
 });
 
 static TITLE_PROGRAM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(explore|step)\b|freshm[ea]n\s*/\s*sophomore").expect("valid regex")
 });
 
-static KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bfreshm[ea]n\w*|\bsophomore\w*|\bjuniors\b|\bseniors\b|\bgraduat|class of").expect("valid regex")
+static PREFERENCE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(preferred|preference|preferably|ideally|a plus|desired|nice to have)\b").expect("valid regex")
 });
+
+static OTHER_KEYWORD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\bfreshm[ea]n\w*|\bsophomore\w*|\bgraduat|class of").expect("valid regex")
+});
+
+fn rising_standing_year(target: &str, season_year: u16) -> Option<u16> {
+    let lower = target.to_lowercase();
+    if lower.starts_with("sophomore") {
+        Some(season_year + 3)
+    } else if lower.starts_with("junior") {
+        Some(season_year + 2)
+    } else if lower.starts_with("senior") {
+        Some(season_year + 1)
+    } else if lower.starts_with("freshm") {
+        Some(season_year + 4)
+    } else {
+        None
+    }
+}
+
+fn count_standing_kinds(text: &str) -> usize {
+    let mut count = 0;
+    if FRESHMAN_RE.is_match(text) {
+        count += 1;
+    }
+    if SOPHOMORE_RE.is_match(text) {
+        count += 1;
+    }
+    if JUNIORS_PLURAL_RE.is_match(text) || JUNIOR_CONTEXT_RE.is_match(text) {
+        count += 1;
+    }
+    if SENIORS_PLURAL_RE.is_match(text) || SENIOR_CONTEXT_RE.is_match(text) {
+        count += 1;
+    }
+    count
+}
+
+fn has_student_context(text: &str) -> bool {
+    ACADEMIC_CONTEXT_RE.is_match(text) || count_standing_kinds(text) >= 2
+}
+
+fn has_class_year_keyword(text: &str) -> bool {
+    if OTHER_KEYWORD_RE.is_match(text) {
+        return true;
+    }
+    if JUNIORS_PLURAL_RE.is_match(text) || SENIORS_PLURAL_RE.is_match(text) {
+        return has_student_context(text);
+    }
+    false
+}
 
 fn extract_standing_years(text: &str, season_year: u16, is_sentence: bool) -> BTreeSet<u16> {
     let mut years = BTreeSet::new();
     let mut bytes = text.as_bytes().to_vec();
 
     // 1. Rising standing words first; mask matched spans
+    let mut last_masked_end = 0;
     for cap in RISING_RE.captures_iter(text) {
         let whole = cap.get(0).expect("group 0 exists");
-        let target = cap.get(1).expect("group 1 exists").as_str();
-        if target.starts_with("sophomore") {
-            years.insert(season_year + 3);
-        } else if target.starts_with("junior") {
-            years.insert(season_year + 2);
-        } else if target.starts_with("senior") {
-            years.insert(season_year + 1);
-        } else if target.starts_with("freshm") {
-            years.insert(season_year + 4);
+        if whole.start() < last_masked_end {
+            continue;
         }
+        let target = cap.get(1).expect("group 1 exists").as_str();
+        if let Some(yr) = rising_standing_year(target, season_year) {
+            years.insert(yr);
+        }
+
+        let mut curr_end = whole.end();
+        while let Some(next_cap) = RISING_NEXT_RE.captures(&text[curr_end..]) {
+            let next_match = next_cap.get(0).expect("group 0 exists");
+            let next_target = next_cap.get(1).expect("group 1 exists").as_str();
+            if let Some(yr) = rising_standing_year(next_target, season_year) {
+                years.insert(yr);
+            }
+            curr_end += next_match.end();
+        }
+
         let start = whole.start();
-        let end = whole.end();
-        bytes[start..end].fill(b' ');
+        bytes[start..curr_end].fill(b' ');
+        last_masked_end = curr_end;
     }
 
     let masked = String::from_utf8(bytes).unwrap_or_else(|_| text.to_string());
@@ -135,9 +198,11 @@ fn extract_standing_years(text: &str, season_year: u16, is_sentence: bool) -> BT
         years.insert(season_year + 2);
     }
 
+    let has_student_ctx = has_student_context(text);
+
     // 4. Junior(s)
     if is_sentence {
-        if JUNIORS_PLURAL_RE.is_match(&masked) || JUNIOR_CONTEXT_RE.is_match(&masked) {
+        if (JUNIORS_PLURAL_RE.is_match(&masked) && has_student_ctx) || JUNIOR_CONTEXT_RE.is_match(&masked) {
             years.insert(season_year + 1);
         }
     } else if JUNIOR_BARE_RE.is_match(&masked) {
@@ -146,7 +211,7 @@ fn extract_standing_years(text: &str, season_year: u16, is_sentence: bool) -> BT
 
     // 5. Senior(s)
     if is_sentence {
-        if SENIORS_PLURAL_RE.is_match(&masked) || SENIOR_CONTEXT_RE.is_match(&masked) {
+        if (SENIORS_PLURAL_RE.is_match(&masked) && has_student_ctx) || SENIOR_CONTEXT_RE.is_match(&masked) {
             years.insert(season_year);
             years.insert(season_year + 1);
         }
@@ -305,6 +370,7 @@ pub fn class_years(inp: &Input, season_year: u16) -> Fact<ClassYears> {
     // Description sentences set
     let mut desc_years = BTreeSet::new();
     let mut desc_ev = None;
+    let mut first_preferred_ev = None;
     for sent in &inp.sentences {
         let mut sent_years = BTreeSet::new();
         if GRAD_SENTENCE_TRIGGER_RE.is_match(sent) {
@@ -312,10 +378,16 @@ pub fn class_years(inp: &Input, season_year: u16) -> Fact<ClassYears> {
         }
         sent_years.extend(extract_standing_years(sent, season_year, true));
         if !sent_years.is_empty() {
-            if desc_ev.is_none() {
-                desc_ev = ev(Source::Description, sent);
+            if PREFERENCE_RE.is_match(sent) {
+                if first_preferred_ev.is_none() {
+                    first_preferred_ev = ev(Source::Description, sent);
+                }
+            } else {
+                if desc_ev.is_none() {
+                    desc_ev = ev(Source::Description, sent);
+                }
+                desc_years.extend(sent_years);
             }
-            desc_years.extend(sent_years);
         }
     }
 
@@ -330,9 +402,16 @@ pub fn class_years(inp: &Input, season_year: u16) -> Fact<ClassYears> {
         };
     }
 
+    if let Some(evidence) = first_preferred_ev {
+        return Fact {
+            value: ClassYears::Unknown,
+            evidence: Some(evidence),
+        };
+    }
+
     // 4. Keywords for Unknown
     for sent in &inp.sentences {
-        if KEYWORD_RE.is_match(sent) {
+        if has_class_year_keyword(sent) {
             return Fact {
                 value: ClassYears::Unknown,
                 evidence: ev(Source::Description, sent),
@@ -340,7 +419,7 @@ pub fn class_years(inp: &Input, season_year: u16) -> Fact<ClassYears> {
         }
     }
     for q in &inp.questions {
-        if KEYWORD_RE.is_match(&q.label) {
+        if has_class_year_keyword(&q.label) {
             return Fact {
                 value: ClassYears::Unknown,
                 evidence: ev(Source::Form, &q.label),
@@ -432,5 +511,72 @@ mod tests {
             class_years(&Input::new("Senior Software Engineer Intern", &page), 2027).value,
             ClassYears::Any
         );
+    }
+
+    #[test]
+    fn class_year_false_no_cases() {
+        assert_eq!(
+            cy("We provide seniors, patients recovering post-discharge and those managing a chronic condition with tailored nutrition solutions to manage their specific needs."),
+            ClassYears::Any
+        );
+        assert_eq!(
+            cy("Direct Supply is building the future of healthcare technology with industry-leading products, solutions and platforms to help improve the lives of millions of seniors and those who care for them."),
+            ClassYears::Any
+        );
+        assert_eq!(
+            cy("Open to juniors and seniors."),
+            set(&[2027, 2028])
+        );
+        assert_eq!(
+            cy("Juniors or seniors pursuing a degree in computer science."),
+            set(&[2027, 2028])
+        );
+        assert_eq!(
+            cy("Must be a rising junior, senior, or master's student."),
+            set(&[2028, 2029])
+        );
+        assert_eq!(
+            cy("Rising sophomores and juniors are encouraged to apply."),
+            set(&[2029, 2030])
+        );
+        assert_eq!(
+            cy("Rising Junior, Senior, or Master's student preferred."),
+            ClassYears::Unknown
+        );
+        assert_eq!(
+            cy("Rising sophomore or junior preferred."),
+            ClassYears::Unknown
+        );
+        assert_eq!(
+            cy("2030 graduation year preferred."),
+            ClassYears::Unknown
+        );
+        assert_eq!(
+            cy("Must be pursuing a degree in computer science, IT, or a related degree (juniors or seniors preferred)."),
+            ClassYears::Unknown
+        );
+        assert_eq!(
+            cy("Open to rising seniors. Sophomore or junior standing preferred."),
+            set(&[2028])
+        );
+
+        let fact_2030 = class_years(&Input::from_text("2030 graduation year preferred."), 2027);
+        assert_eq!(fact_2030.value, ClassYears::Unknown);
+        assert!(fact_2030.evidence.is_some());
+        assert_eq!(fact_2030.evidence.unwrap().source, Source::Description);
+
+        let moms_meals = "We provide seniors, patients recovering post-discharge and those managing a chronic condition with tailored nutrition solutions to manage their specific needs. ";
+        let page = PortalPage {
+            description: format!("{}{}", moms_meals, "We build things. ".repeat(20)),
+            questions: vec![FormQuestion {
+                label: "What will your current academic standing be at the time this internship begins?".into(),
+                options: ["Freshman", "Sophomore", "Junior", "Senior", "Graduate student", "Recently graduated", "Other / Not applicable"]
+                    .map(String::from)
+                    .to_vec(),
+            }],
+        };
+        let f = class_years(&Input::new("Data Analytics Intern", &page), 2027);
+        assert_eq!(f.value, ClassYears::Any);
+        assert_eq!(f.evidence.unwrap().source, Source::Form);
     }
 }
