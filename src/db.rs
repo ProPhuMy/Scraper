@@ -48,6 +48,7 @@ pub(crate) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             last_error TEXT,
             page TEXT,
             facts TEXT,
+            llm_facts TEXT,
             scanned_at INTEGER,
             starred INTEGER NOT NULL DEFAULT 0,
             hidden INTEGER NOT NULL DEFAULT 0,
@@ -77,6 +78,66 @@ pub(crate) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     if !columns.contains("first_seen") {
         conn.execute("ALTER TABLE jobs ADD COLUMN first_seen INTEGER", [])?;
     }
+    if !columns.contains("llm_facts") {
+        conn.execute("ALTER TABLE jobs ADD COLUMN llm_facts TEXT", [])?;
+    }
+
+    // Migration: split LLM facts out of `facts` into `llm_facts`
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, facts, llm_facts FROM jobs WHERE facts LIKE '%\"source\":\"llm\"%' OR facts LIKE '%\"source\": \"llm\"%'"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let facts_str: Option<String> = row.get(1)?;
+            let llm_facts_str: Option<String> = row.get(2)?;
+            Ok((id, facts_str, llm_facts_str))
+        })?;
+
+        let mut updates = Vec::new();
+        for r in rows {
+            let (id, facts_str, llm_facts_str) = r?;
+            if let Some(f_str) = facts_str {
+                if let Ok(f) = serde_json::from_str::<Facts>(&f_str) {
+                    let has_llm = f.class_years.evidence.as_ref().map(|e| e.source) == Some(crate::model::Source::Llm)
+                        || f.gpa.evidence.as_ref().map(|e| e.source) == Some(crate::model::Source::Llm)
+                        || f.sponsorship.evidence.as_ref().map(|e| e.source) == Some(crate::model::Source::Llm)
+                        || f.citizenship.evidence.as_ref().map(|e| e.source) == Some(crate::model::Source::Llm)
+                        || f.experience.evidence.as_ref().map(|e| e.source) == Some(crate::model::Source::Llm);
+
+                    if has_llm {
+                        let rules_part = f.rules_part();
+                        let llm_part = f.llm_part();
+                        let rules_json = serde_json::to_string(&rules_part)?;
+                        let write_llm = llm_facts_str.is_none();
+                        let llm_json = if write_llm {
+                            Some(serde_json::to_string(&llm_part)?)
+                        } else {
+                            None
+                        };
+                        updates.push((id, rules_json, llm_json));
+                    }
+                }
+            }
+        }
+        drop(stmt);
+
+        for (id, rules_json, llm_json) in updates {
+            if let Some(l_json) = llm_json {
+                tx.execute(
+                    "UPDATE jobs SET facts = ?1, llm_facts = ?2 WHERE id = ?3 AND llm_facts IS NULL",
+                    params![rules_json, l_json, id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE jobs SET facts = ?1 WHERE id = ?2",
+                    params![rules_json, id],
+                )?;
+            }
+        }
+    }
+    tx.commit()?;
 
     let sync_count_exists: bool = conn
         .query_row(
@@ -220,6 +281,7 @@ pub fn upsert_jobs(conn: &mut Connection, jobs: &[NewJob]) -> anyhow::Result<Syn
                             last_error = NULL,
                             page = NULL,
                             facts = NULL,
+                            llm_facts = NULL,
                             scanned_at = NULL,
                             active = 1
                         WHERE id = ?9",
@@ -294,7 +356,7 @@ pub fn save_page(conn: &Connection, job_id: i64, page: &PortalPage, facts: &Fact
         .as_secs() as i64;
 
     conn.execute(
-        "UPDATE jobs SET status = 'rules_done', page = ?1, facts = ?2, scanned_at = ?3, last_error = NULL WHERE id = ?4",
+        "UPDATE jobs SET status = 'rules_done', page = ?1, facts = ?2, llm_facts = NULL, scanned_at = ?3, last_error = NULL WHERE id = ?4",
         params![page_json, facts_json, now, job_id],
     )?;
     Ok(())
@@ -385,13 +447,28 @@ pub fn llm_candidates(
     Ok(result)
 }
 
-pub fn save_llm(conn: &Connection, job_id: i64, facts: &Facts) -> anyhow::Result<()> {
-    let facts_json = serde_json::to_string(facts).context("failed to serialize Facts")?;
+pub fn save_llm(conn: &Connection, job_id: i64, llm_facts: &Facts) -> anyhow::Result<()> {
+    let llm_facts_json = serde_json::to_string(llm_facts).context("failed to serialize Facts")?;
     conn.execute(
-        "UPDATE jobs SET status = 'llm_done', facts = ?1, last_error = NULL WHERE id = ?2",
-        params![facts_json, job_id],
+        "UPDATE jobs SET status = 'llm_done', llm_facts = ?1, last_error = NULL WHERE id = ?2",
+        params![llm_facts_json, job_id],
     )?;
     Ok(())
+}
+
+pub fn stored_facts(conn: &Connection, job_id: i64) -> anyhow::Result<Option<Facts>> {
+    let facts_str: Option<String> = conn
+        .query_row(
+            "SELECT facts FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match facts_str {
+        Some(s) => Ok(serde_json::from_str::<Facts>(&s).ok()),
+        None => Ok(None),
+    }
 }
 
 pub fn recheck_jobs(
@@ -476,6 +553,7 @@ pub struct Row {
     pub job: Job,
     pub status: Status,
     pub facts: Option<Facts>,
+    pub llm_facts: Option<Facts>,
     pub date_posted: i64,
     pub active: bool,
     pub marks: Marks,
@@ -518,7 +596,7 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
 
     let mut stmt = conn.prepare(
         "SELECT id, simplify_id, company, title, url, provider, status, facts, date_posted,
-                active, starred, hidden, applied_at, first_seen, locations, page
+                active, starred, hidden, applied_at, first_seen, locations, page, llm_facts
          FROM jobs
          WHERE active = 1 OR starred = 1 OR hidden = 1 OR applied_at IS NOT NULL
          ORDER BY date_posted DESC"
@@ -541,6 +619,7 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
         let first_seen: Option<i64> = row.get(13)?;
         let locations_str: Option<String> = row.get(14)?;
         let page_str: Option<String> = row.get(15)?;
+        let llm_facts_str: Option<String> = row.get(16)?;
 
         let provider = Provider::parse(&provider_str);
         let status = Status::parse(&status_str);
@@ -590,12 +669,13 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
             is_new,
             locations,
             asks_location,
+            llm_facts_str,
         ))
     })?;
 
     let mut result = Vec::new();
     for r in rows {
-        let (job, status, facts_str, date_posted, active, marks, is_new, locations, asks_location) = r?;
+        let (job, status, facts_str, date_posted, active, marks, is_new, locations, asks_location, llm_facts_str) = r?;
         let facts = match facts_str {
             Some(s) => Some(
                 serde_json::from_str::<Facts>(&s)
@@ -603,10 +683,14 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
             ),
             None => None,
         };
+        let llm_facts = llm_facts_str
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Facts>(s).ok());
         result.push(Row {
             job,
             status,
             facts,
+            llm_facts,
             date_posted,
             active,
             marks,
@@ -832,7 +916,8 @@ mod tests {
         let rows = list_jobs(&c).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, Status::LlmDone);
-        assert_eq!(rows[0].facts, Some(new_facts));
+        assert_eq!(rows[0].facts, Some(Facts::unknown()));
+        assert_eq!(rows[0].llm_facts, Some(new_facts));
     }
 
     #[test]
@@ -1372,5 +1457,196 @@ mod tests {
 
         let non_existent = stored_page(&conn, 999).unwrap();
         assert_eq!(non_existent, None);
+    }
+
+    #[test]
+    fn save_llm_writes_llm_facts_only() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        upsert_jobs(&mut c, &[a]).unwrap();
+
+        let page = PortalPage {
+            description: "desc".to_string(),
+            questions: vec![],
+        };
+        let mut r = Facts::unknown();
+        r.sponsorship.value = Sponsorship::Asked;
+        save_page(&c, 1, &page, &r).unwrap();
+
+        let mut l = Facts::unknown();
+        l.class_years.value = ClassYears::Grad(std::collections::BTreeSet::from([2027]));
+        save_llm(&c, 1, &l).unwrap();
+
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].facts, Some(r));
+        assert_eq!(rows[0].llm_facts, Some(l));
+        assert_eq!(rows[0].status, Status::LlmDone);
+    }
+
+    #[test]
+    fn save_page_clears_llm_facts() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        upsert_jobs(&mut c, &[a]).unwrap();
+
+        let page = PortalPage {
+            description: "desc".to_string(),
+            questions: vec![],
+        };
+        let mut r = Facts::unknown();
+        r.sponsorship.value = Sponsorship::Asked;
+        save_page(&c, 1, &page, &r).unwrap();
+
+        let mut l = Facts::unknown();
+        l.class_years.value = ClassYears::Grad(std::collections::BTreeSet::from([2027]));
+        save_llm(&c, 1, &l).unwrap();
+
+        save_page(&c, 1, &page, &r).unwrap();
+
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].llm_facts, None);
+        assert_eq!(rows[0].status, Status::RulesDone);
+    }
+
+    #[test]
+    fn migration_splits_llm_facts() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY,
+                simplify_id TEXT UNIQUE NOT NULL,
+                company TEXT NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                url TEXT NOT NULL,
+                locations TEXT NOT NULL,
+                date_posted INTEGER NOT NULL,
+                date_updated INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                page TEXT,
+                facts TEXT,
+                scanned_at INTEGER,
+                starred INTEGER NOT NULL DEFAULT 0,
+                hidden INTEGER NOT NULL DEFAULT 0,
+                applied_at INTEGER,
+                first_seen INTEGER
+            );
+            CREATE TABLE meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );"
+        )
+        .unwrap();
+
+        let mut merged = Facts::unknown();
+        merged.class_years = crate::model::Fact {
+            value: ClassYears::Grad(std::collections::BTreeSet::from([2027, 2028])),
+            evidence: Some(crate::model::Evidence {
+                source: crate::model::Source::Llm,
+                snippet: "graduating 2027 or 2028".to_string(),
+            }),
+        };
+        merged.sponsorship = crate::model::Fact {
+            value: Sponsorship::Asked,
+            evidence: Some(crate::model::Evidence {
+                source: crate::model::Source::Form,
+                snippet: "Will you require sponsorship?".to_string(),
+            }),
+        };
+        let merged_json = serde_json::to_string(&merged).unwrap();
+
+        conn.execute(
+            "INSERT INTO jobs (
+                simplify_id, company, title, category, provider, url,
+                locations, date_posted, date_updated, status, facts
+            ) VALUES (
+                'old_1', 'OldCo', 'Engineer', 'Software', 'other', 'https://example.com/old',
+                '[]', 1000, 1000, 'llm_done', ?1
+            )",
+            params![merged_json],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let rows = list_jobs(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].facts, Some(merged.rules_part()));
+        assert_eq!(rows[0].llm_facts, Some(merged.llm_part()));
+
+        init_schema(&conn).unwrap();
+        let rows2 = list_jobs(&conn).unwrap();
+        assert_eq!(rows2[0].facts, Some(merged.rules_part()));
+        assert_eq!(rows2[0].llm_facts, Some(merged.llm_part()));
+    }
+
+    #[test]
+    fn migration_leaves_rules_rows_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY,
+                simplify_id TEXT UNIQUE NOT NULL,
+                company TEXT NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                url TEXT NOT NULL,
+                locations TEXT NOT NULL,
+                date_posted INTEGER NOT NULL,
+                date_updated INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                page TEXT,
+                facts TEXT,
+                scanned_at INTEGER,
+                starred INTEGER NOT NULL DEFAULT 0,
+                hidden INTEGER NOT NULL DEFAULT 0,
+                applied_at INTEGER,
+                first_seen INTEGER
+            );
+            CREATE TABLE meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );"
+        )
+        .unwrap();
+
+        let mut rules_facts = Facts::unknown();
+        rules_facts.sponsorship = crate::model::Fact {
+            value: Sponsorship::Asked,
+            evidence: Some(crate::model::Evidence {
+                source: crate::model::Source::Form,
+                snippet: "sponsorship question".to_string(),
+            }),
+        };
+        let rules_json = serde_json::to_string(&rules_facts).unwrap();
+
+        conn.execute(
+            "INSERT INTO jobs (
+                simplify_id, company, title, category, provider, url,
+                locations, date_posted, date_updated, status, facts
+            ) VALUES (
+                'rules_row', 'RulesCo', 'Engineer', 'Software', 'other', 'https://example.com/rules',
+                '[]', 1000, 1000, 'rules_done', ?1
+            )",
+            params![rules_json],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let rows = list_jobs(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].facts, Some(rules_facts));
+        assert_eq!(rows[0].llm_facts, None);
     }
 }

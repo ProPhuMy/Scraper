@@ -439,6 +439,7 @@ mod tests {
             },
             status,
             facts,
+            llm_facts: None,
             date_posted,
             active,
             marks,

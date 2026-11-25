@@ -811,6 +811,7 @@ mod tests {
             },
             status: Status::RulesDone,
             facts: Some(clean_facts()),
+            llm_facts: None,
             date_posted: 1000,
             active,
             marks,

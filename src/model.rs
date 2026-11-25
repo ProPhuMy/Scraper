@@ -200,6 +200,150 @@ impl Facts {
         }
         names
     }
+
+    pub fn llm_part(&self) -> Facts {
+        let is_llm = |ev: &Option<Evidence>| {
+            ev.as_ref().map(|e| e.source) == Some(Source::Llm)
+        };
+        Facts {
+            class_years: if is_llm(&self.class_years.evidence) {
+                self.class_years.clone()
+            } else {
+                Fact {
+                    value: ClassYears::Unknown,
+                    evidence: None,
+                }
+            },
+            gpa: if is_llm(&self.gpa.evidence) {
+                self.gpa.clone()
+            } else {
+                Fact {
+                    value: Gpa::Unknown,
+                    evidence: None,
+                }
+            },
+            sponsorship: if is_llm(&self.sponsorship.evidence) {
+                self.sponsorship.clone()
+            } else {
+                Fact {
+                    value: Sponsorship::Unknown,
+                    evidence: None,
+                }
+            },
+            citizenship: if is_llm(&self.citizenship.evidence) {
+                self.citizenship.clone()
+            } else {
+                Fact {
+                    value: Citizenship::Unknown,
+                    evidence: None,
+                }
+            },
+            experience: if is_llm(&self.experience.evidence) {
+                self.experience.clone()
+            } else {
+                Fact {
+                    value: Experience::Unknown,
+                    evidence: None,
+                }
+            },
+        }
+    }
+
+    pub fn rules_part(&self) -> Facts {
+        let is_llm = |ev: &Option<Evidence>| {
+            ev.as_ref().map(|e| e.source) == Some(Source::Llm)
+        };
+        Facts {
+            class_years: if is_llm(&self.class_years.evidence) {
+                Fact {
+                    value: ClassYears::Unknown,
+                    evidence: None,
+                }
+            } else {
+                self.class_years.clone()
+            },
+            gpa: if is_llm(&self.gpa.evidence) {
+                Fact {
+                    value: Gpa::Unknown,
+                    evidence: None,
+                }
+            } else {
+                self.gpa.clone()
+            },
+            sponsorship: if is_llm(&self.sponsorship.evidence) {
+                Fact {
+                    value: Sponsorship::Unknown,
+                    evidence: None,
+                }
+            } else {
+                self.sponsorship.clone()
+            },
+            citizenship: if is_llm(&self.citizenship.evidence) {
+                Fact {
+                    value: Citizenship::Unknown,
+                    evidence: None,
+                }
+            } else {
+                self.citizenship.clone()
+            },
+            experience: if is_llm(&self.experience.evidence) {
+                Fact {
+                    value: Experience::Unknown,
+                    evidence: None,
+                }
+            } else {
+                self.experience.clone()
+            },
+        }
+    }
+
+    pub fn overlay(&self, llm: &Facts) -> Facts {
+        Facts {
+            class_years: if matches!(self.class_years.value, ClassYears::Unknown)
+                && !matches!(llm.class_years.value, ClassYears::Unknown)
+            {
+                llm.class_years.clone()
+            } else {
+                self.class_years.clone()
+            },
+            gpa: if matches!(self.gpa.value, Gpa::Unknown)
+                && !matches!(llm.gpa.value, Gpa::Unknown)
+            {
+                llm.gpa.clone()
+            } else {
+                self.gpa.clone()
+            },
+            sponsorship: if matches!(self.sponsorship.value, Sponsorship::Unknown)
+                && !matches!(llm.sponsorship.value, Sponsorship::Unknown)
+            {
+                llm.sponsorship.clone()
+            } else {
+                self.sponsorship.clone()
+            },
+            citizenship: if matches!(self.citizenship.value, Citizenship::Unknown)
+                && !matches!(llm.citizenship.value, Citizenship::Unknown)
+            {
+                llm.citizenship.clone()
+            } else {
+                self.citizenship.clone()
+            },
+            experience: if matches!(self.experience.value, Experience::Unknown)
+                && !matches!(llm.experience.value, Experience::Unknown)
+            {
+                llm.experience.clone()
+            } else {
+                self.experience.clone()
+            },
+        }
+    }
+
+    pub fn has_any_known(&self) -> bool {
+        !matches!(self.class_years.value, ClassYears::Unknown)
+            || !matches!(self.gpa.value, Gpa::Unknown)
+            || !matches!(self.sponsorship.value, Sponsorship::Unknown)
+            || !matches!(self.citizenship.value, Citizenship::Unknown)
+            || !matches!(self.experience.value, Experience::Unknown)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,5 +450,61 @@ mod tests {
             assert_eq!(Status::parse(s.as_str()), s);
         }
         assert_eq!(Status::parse("garbage"), Status::Error);
+    }
+
+    #[test]
+    fn split_and_overlay_roundtrip() {
+        let mut years = BTreeSet::new();
+        years.insert(2027);
+        years.insert(2028);
+
+        let mut merged = Facts::unknown();
+        merged.class_years = Fact {
+            value: ClassYears::Grad(years.clone()),
+            evidence: Some(Evidence {
+                source: Source::Llm,
+                snippet: "graduating 2027 or 2028".to_string(),
+            }),
+        };
+        merged.sponsorship = Fact {
+            value: Sponsorship::Asked,
+            evidence: Some(Evidence {
+                source: Source::Form,
+                snippet: "Will you require sponsorship?".to_string(),
+            }),
+        };
+
+        assert_eq!(merged.rules_part().class_years.value, ClassYears::Unknown);
+        assert_eq!(merged.rules_part().class_years.evidence, None);
+        assert_eq!(merged.rules_part().sponsorship.value, Sponsorship::Asked);
+        assert_eq!(merged.llm_part().class_years.value, ClassYears::Grad(years));
+        assert_eq!(merged.llm_part().sponsorship.value, Sponsorship::Unknown);
+        assert_eq!(merged.llm_part().sponsorship.evidence, None);
+        assert_eq!(merged.rules_part().overlay(&merged.llm_part()), merged);
+        assert!(merged.llm_part().has_any_known());
+        assert!(!Facts::unknown().has_any_known());
+    }
+
+    #[test]
+    fn overlay_never_overrides_rules() {
+        let mut rules = Facts::unknown();
+        rules.citizenship = Fact {
+            value: Citizenship::NotMentioned,
+            evidence: Some(Evidence {
+                source: Source::Description,
+                snippet: "description snippet".to_string(),
+            }),
+        };
+
+        let mut llm = Facts::unknown();
+        llm.citizenship = Fact {
+            value: Citizenship::Required,
+            evidence: Some(Evidence {
+                source: Source::Llm,
+                snippet: "US citizenship required".to_string(),
+            }),
+        };
+
+        assert_eq!(rules.overlay(&llm).citizenship.value, Citizenship::NotMentioned);
     }
 }

@@ -819,6 +819,7 @@ mod tests {
             },
             status,
             facts: Some(clean()),
+            llm_facts: None,
             date_posted: 100,
             active,
             marks,
