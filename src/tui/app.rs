@@ -12,6 +12,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     SaveMarks(Vec<(i64, Marks)>),
+    SaveNote(Vec<i64>, Option<String>),
     OpenUrl(String),
     Refresh,
 }
@@ -68,6 +69,8 @@ pub struct App {
     pub lines: Vec<Line>,
     pub refreshing: bool,
     pub progress: Option<String>,
+    pub note_input: Option<String>,
+    pub note_target_ids: Vec<i64>,
     pub(crate) refresh_inserted: usize,
     pub(crate) refresh_scanned: usize,
     pub(crate) refresh_llm_note: Option<&'static str>,
@@ -93,6 +96,8 @@ impl App {
             lines: Vec::new(),
             refreshing: false,
             progress: None,
+            note_input: None,
+            note_target_ids: Vec::new(),
             refresh_inserted: 0,
             refresh_scanned: 0,
             refresh_llm_note: None,
@@ -198,6 +203,46 @@ impl App {
                     self.searching = false;
                     self.rebuild_lines();
                     self.clamp_selected();
+                }
+                _ => {}
+            }
+            return Vec::new();
+        }
+
+        if let Some(ref mut input) = self.note_input {
+            match key.code {
+                KeyCode::Char(c) => {
+                    input.push(c);
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Enter => {
+                    let text = self.note_input.take().unwrap();
+                    let target_ids = std::mem::take(&mut self.note_target_ids);
+                    let trimmed = text.trim();
+                    let opt_note = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.chars().take(200).collect::<String>())
+                    };
+                    self.status_msg = Some(if opt_note.is_some() {
+                        "note saved".to_string()
+                    } else {
+                        "note removed".to_string()
+                    });
+                    for id in &target_ids {
+                        if let Some(r) = self.rows.iter_mut().find(|r| r.job.id == *id) {
+                            r.note = opt_note.clone();
+                        }
+                    }
+                    self.rebuild_lines();
+                    self.clamp_selected();
+                    return vec![Action::SaveNote(target_ids, opt_note)];
+                }
+                KeyCode::Esc => {
+                    self.note_input = None;
+                    self.note_target_ids.clear();
                 }
                 _ => {}
             }
@@ -475,6 +520,56 @@ impl App {
                     self.status_msg = None;
                     vec![Action::Refresh]
                 }
+            }
+            KeyCode::Char('x') => {
+                let view = self.visible_rows();
+                let loc_rows = merge_locations(view);
+                let (target_ids, prefill) = match self.lines.get(self.selected) {
+                    Some(Line::Header(g_idx)) => {
+                        let groups = group_view(loc_rows);
+                        if let Some(group) = groups.get(*g_idx) {
+                            let all_ids = group.rows.iter().flat_map(|r| r.job_ids()).collect();
+                            let prefill = group.rows[0].members[0].row.note.clone().unwrap_or_default();
+                            (all_ids, prefill)
+                        } else {
+                            (Vec::new(), String::new())
+                        }
+                    }
+                    Some(Line::Child(g_idx, _)) => {
+                        let groups = group_view(loc_rows);
+                        if let Some(group) = groups.get(*g_idx) {
+                            let all_ids = group.rows.iter().flat_map(|r| r.job_ids()).collect();
+                            let prefill = group.rows[0].members[0].row.note.clone().unwrap_or_default();
+                            (all_ids, prefill)
+                        } else {
+                            (Vec::new(), String::new())
+                        }
+                    }
+                    Some(Line::Plain(idx)) => {
+                        if self.tab == Tab::Jobs {
+                            let groups = group_view(loc_rows);
+                            if let Some(group) = groups.get(*idx) {
+                                let all_ids = group.rows.iter().flat_map(|r| r.job_ids()).collect();
+                                let prefill = group.rows[0].members[0].row.note.clone().unwrap_or_default();
+                                (all_ids, prefill)
+                            } else {
+                                (Vec::new(), String::new())
+                            }
+                        } else if let Some(loc_row) = loc_rows.get(*idx) {
+                            let ids = loc_row.job_ids();
+                            let prefill = loc_row.members[0].row.note.clone().unwrap_or_default();
+                            (ids, prefill)
+                        } else {
+                            (Vec::new(), String::new())
+                        }
+                    }
+                    None => (Vec::new(), String::new()),
+                };
+                if !target_ids.is_empty() {
+                    self.note_input = Some(prefill);
+                    self.note_target_ids = target_ids;
+                }
+                Vec::new()
             }
             _ => Vec::new(),
         }
@@ -818,6 +913,8 @@ mod tests {
             is_new: false,
             locations: vec![],
             asks_location: false,
+            form_checked: false,
+            note: None,
         }
     }
 
@@ -1248,5 +1345,139 @@ mod tests {
                 .unwrap()
                 .contains("(LLM: quota reached)")
         );
+    }
+
+    #[test]
+    fn test_note_key_opens_input_prefilled() {
+        let mut r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        r1.note = Some("existing note".to_string());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        app.filter = VerdictFilter::All;
+        app.rebuild_lines();
+        let action = app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert!(action.is_empty());
+        assert_eq!(app.note_input.as_deref(), Some("existing note"));
+        assert_eq!(app.note_target_ids, vec![1]);
+    }
+
+    #[test]
+    fn test_note_input_typing_and_backspace() {
+        let r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert_eq!(app.note_input.as_deref(), Some(""));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()));
+        assert!(!app.quit);
+        assert_eq!(app.note_input.as_deref(), Some("hiq"));
+
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        assert_eq!(app.note_input.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn test_note_input_save_enter() {
+        let r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()));
+
+        let actions = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(actions, vec![Action::SaveNote(vec![1], Some("ok".to_string()))]);
+        assert_eq!(app.note_input, None);
+        assert_eq!(app.status_msg.as_deref(), Some("note saved"));
+        assert_eq!(app.rows[0].note.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn test_note_input_remove_enter() {
+        let mut r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        r1.note = Some("old".to_string());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        app.filter = VerdictFilter::All;
+        app.rebuild_lines();
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()));
+
+        let actions = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(actions, vec![Action::SaveNote(vec![1], None)]);
+        assert_eq!(app.note_input, None);
+        assert_eq!(app.status_msg.as_deref(), Some("note removed"));
+        assert_eq!(app.rows[0].note, None);
+    }
+
+    #[test]
+    fn test_note_input_esc_cancels() {
+        let r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()));
+
+        let actions = app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(actions.is_empty());
+        assert_eq!(app.note_input, None);
+        assert_eq!(app.rows[0].note, None);
+    }
+
+    #[test]
+    fn test_note_group_applies_to_all_ids() {
+        let r1 = make_row_with_locs(1, "Acme", "SWE", true, Marks::default(), 100, vec!["SF".into()]);
+        let r2 = make_row_with_locs(2, "Acme", "SWE", true, Marks::default(), 200, vec!["NYC".into()]);
+        let cfg = test_config();
+        let mut app = App::new(vec![r1, r2], &cfg);
+        app.filter = VerdictFilter::All;
+        app.rebuild_lines();
+        assert!(matches!(app.lines[0], Line::Header(_)));
+
+        // Press x on group header
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert_eq!(app.note_target_ids.len(), 2);
+        assert!(app.note_target_ids.contains(&1));
+        assert!(app.note_target_ids.contains(&2));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()));
+        let actions = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        match &actions[0] {
+            Action::SaveNote(ids, note) => {
+                assert_eq!(ids.len(), 2);
+                assert!(ids.contains(&1));
+                assert!(ids.contains(&2));
+                assert_eq!(note.as_deref(), Some("b"));
+            }
+            _ => panic!("expected SaveNote"),
+        }
+
+        // Expand group and press x on child row
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(matches!(app.lines[app.selected], Line::Child(_, _)));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert_eq!(app.note_target_ids.len(), 2);
+        assert!(app.note_target_ids.contains(&1));
+        assert!(app.note_target_ids.contains(&2));
+    }
+
+    #[test]
+    fn test_search_mode_x_types_x() {
+        let r1 = make_row(1, "Acme", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        app.on_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::empty()));
+        assert!(app.searching);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert_eq!(app.search, "x");
+        assert!(app.searching);
+        assert_eq!(app.note_input, None);
     }
 }

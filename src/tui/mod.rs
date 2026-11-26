@@ -99,6 +99,23 @@ fn run_loop(
                                     }
                                 }
                             }
+                            Action::SaveNote(ids, note_val) => {
+                                for job_id in ids {
+                                    if let Err(e) = db::set_note(conn, job_id, note_val.as_deref()) {
+                                        app.status_msg = Some(format!("failed to save note: {e}"));
+                                    }
+                                }
+                                match db::list_jobs(conn) {
+                                    Ok(rows) => {
+                                        app.rows = rows;
+                                        app.rebuild_lines();
+                                        app.clamp_selected();
+                                    }
+                                    Err(e) => {
+                                        app.status_msg = Some(format!("failed to reload jobs: {e}"));
+                                    }
+                                }
+                            }
                             Action::OpenUrl(url) => {
                                 if let Err(e) = open_url(&url) {
                                     app.status_msg = Some(format!("failed to open URL: {e}"));

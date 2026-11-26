@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::config::Profile;
 use crate::db::{Marks, Row};
 use crate::model::Status;
-use crate::verdict::{judge, llm_hint, Judgement, Verdict};
+use crate::verdict::{judge_row, llm_hint, Judgement, Verdict};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -117,7 +117,7 @@ pub fn build_view<'a>(
             }
         })
         .map(|row| {
-            let judgement = judge(row.status, row.facts.as_ref(), profile, season_year);
+            let judgement = judge_row(row, profile, season_year);
             let hint = llm_hint(row, profile, season_year);
             ViewRow { row, judgement, hint }
         })
@@ -394,6 +394,7 @@ pub fn toggle_many(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use crate::verdict::judge;
     use crate::model::{
         Citizenship, ClassYears, Fact, Facts, Gpa, Job, Provider, Sponsorship, Status, Experience,
     };
@@ -461,6 +462,8 @@ mod tests {
             is_new: false,
             locations: vec![],
             asks_location: false,
+            form_checked: false,
+            note: None,
         }
     }
 

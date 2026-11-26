@@ -28,6 +28,31 @@ pub struct Judgement {
     pub year_confirmed: bool,
 }
 
+pub fn judge_row(
+    row: &db::Row,
+    profile: &Profile,
+    season_year: u16,
+) -> Judgement {
+    if let Some(ref note) = row.note {
+        let trimmed = note.trim();
+        if !trimmed.is_empty() {
+            return Judgement {
+                verdict: Verdict::No,
+                reason: format!("your note: {trimmed}"),
+                year_confirmed: false,
+            };
+        }
+    }
+    judge(row.status, row.facts.as_ref(), profile, season_year)
+}
+
+pub fn shows_unchecked_star(row: &db::Row, j: &Judgement) -> bool {
+    !row.form_checked
+        && matches!(j.verdict, Verdict::Apply | Verdict::Maybe)
+        && matches!(row.status, Status::RulesDone | Status::LlmDone)
+        && row.note.as_deref().map(|s| s.trim()).unwrap_or("").is_empty()
+}
+
 pub fn judge(
     status: Status,
     facts: Option<&Facts>,
@@ -290,18 +315,24 @@ pub fn render_table(view: &[views::ViewRow], color: bool) -> String {
             format!("{}{}", mark_text, " ".repeat(mark_pad))
         };
 
+        let star = shows_unchecked_star(vr.row, &vr.judgement);
         let formatted_verdict = if color {
-            match vr.judgement.verdict {
-                Verdict::Apply => format!("{}  ", "apply".green()),
-                Verdict::Maybe => format!("{}  ", "maybe".yellow()),
-                Verdict::No => format!("{}     ", "no".red()),
+            match (vr.judgement.verdict, star) {
+                (Verdict::Apply, true) => format!("{} ", "apply*".green()),
+                (Verdict::Apply, false) => format!("{}  ", "apply".green()),
+                (Verdict::Maybe, true) => format!("{} ", "maybe*".yellow()),
+                (Verdict::Maybe, false) => format!("{}  ", "maybe".yellow()),
+                (Verdict::No, _) => format!("{}     ", "no".red()),
             }
         } else {
-            match vr.judgement.verdict {
-                Verdict::Apply => format!("{:<7}", "apply"),
-                Verdict::Maybe => format!("{:<7}", "maybe"),
-                Verdict::No => format!("{:<7}", "no"),
-            }
+            let v_str = match (vr.judgement.verdict, star) {
+                (Verdict::Apply, true) => "apply*",
+                (Verdict::Apply, false) => "apply",
+                (Verdict::Maybe, true) => "maybe*",
+                (Verdict::Maybe, false) => "maybe",
+                (Verdict::No, _) => "no",
+            };
+            format!("{:<7}", v_str)
         };
 
         let formatted_llm = if color {
@@ -366,6 +397,8 @@ pub struct JsonOutput<'a> {
     pub new: bool,
     pub locations: &'a [String],
     pub closed: bool,
+    pub form_checked: bool,
+    pub note: Option<&'a str>,
 }
 
 /// Writes to stdout, treating a closed pipe (`scraper list | head`) as success instead of panicking.
@@ -427,7 +460,7 @@ pub fn list(
     let mut view_rows: Vec<views::ViewRow> = selected_rows
         .into_iter()
         .map(|row| {
-            let judgement = judge(row.status, row.facts.as_ref(), &profile, cfg.season_year);
+            let judgement = judge_row(row, &profile, cfg.season_year);
             let hint = llm_hint(row, &profile, cfg.season_year);
             views::ViewRow { row, judgement, hint }
         })
@@ -486,6 +519,8 @@ pub fn list(
                 new: vr.row.is_new,
                 locations: &vr.row.locations,
                 closed: views::is_closed(vr.row),
+                form_checked: vr.row.form_checked,
+                note: vr.row.note.as_deref(),
             })
             .collect();
 
@@ -868,6 +903,8 @@ mod tests {
             is_new,
             locations: vec![],
             asks_location: false,
+            form_checked: true,
+            note: None,
         }
     }
 
@@ -1049,6 +1086,8 @@ mod tests {
             new: view_row.row.is_new,
             locations: &view_row.row.locations,
             closed: views::is_closed(view_row.row),
+            form_checked: view_row.row.form_checked,
+            note: view_row.row.note.as_deref(),
         })
         .unwrap();
 
@@ -1129,6 +1168,8 @@ mod tests {
             new: view_row.row.is_new,
             locations: &view_row.row.locations,
             closed: views::is_closed(view_row.row),
+            form_checked: view_row.row.form_checked,
+            note: view_row.row.note.as_deref(),
         })
         .unwrap();
 
@@ -1199,6 +1240,8 @@ mod tests {
             new: view_row.row.is_new,
             locations: &view_row.row.locations,
             closed: views::is_closed(view_row.row),
+            form_checked: view_row.row.form_checked,
+            note: view_row.row.note.as_deref(),
         })
         .unwrap();
 
@@ -1350,6 +1393,8 @@ mod tests {
             new: vr_hint.row.is_new,
             locations: &vr_hint.row.locations,
             closed: views::is_closed(vr_hint.row),
+            form_checked: vr_hint.row.form_checked,
+            note: vr_hint.row.note.as_deref(),
         }).unwrap();
 
         assert_eq!(json_hint["llm"]["verdict"], "no");
@@ -1384,8 +1429,178 @@ mod tests {
             new: vr_none.row.is_new,
             locations: &vr_none.row.locations,
             closed: views::is_closed(vr_none.row),
+            form_checked: vr_none.row.form_checked,
+            note: vr_none.row.note.as_deref(),
         }).unwrap();
 
         assert!(json_none["llm"].is_null());
+    }
+
+    #[test]
+    fn test_judge_row_note_overrides_apply() {
+        let mut row = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        row.note = Some("too far away".to_string());
+        let j = judge_row(&row, &profile(), 2027);
+        assert_eq!(j.verdict, Verdict::No);
+        assert_eq!(j.reason, "your note: too far away");
+        assert!(!j.year_confirmed);
+    }
+
+    #[test]
+    fn test_judge_row_note_overrides_gone() {
+        let mut row = make_test_row(1, "Acme", "SWE", false, crate::db::Marks::default(), false, Status::Gone);
+        row.note = Some("closed early".to_string());
+        let j = judge_row(&row, &profile(), 2027);
+        assert_eq!(j.verdict, Verdict::No);
+        assert_eq!(j.reason, "your note: closed early");
+        assert!(!j.year_confirmed);
+    }
+
+    #[test]
+    fn test_judge_row_whitespace_note_ignored() {
+        let mut row = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        row.note = Some("   \t  ".to_string());
+        let j = judge_row(&row, &profile(), 2027);
+        assert_eq!(j.verdict, Verdict::Apply);
+        assert_eq!(j.reason, "no blockers found");
+
+        row.note = None;
+        let j2 = judge_row(&row, &profile(), 2027);
+        assert_eq!(j2.verdict, Verdict::Apply);
+        assert_eq!(j2.reason, "no blockers found");
+    }
+
+    #[test]
+    fn test_shows_unchecked_star_cases() {
+        let mut row = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        row.form_checked = false;
+        let j_apply = Judgement { verdict: Verdict::Apply, reason: "clean".into(), year_confirmed: true };
+        let j_maybe = Judgement { verdict: Verdict::Maybe, reason: "unclear".into(), year_confirmed: false };
+        let j_no = Judgement { verdict: Verdict::No, reason: "blocked".into(), year_confirmed: false };
+
+        // 1. Apply + RulesDone + form_checked=false -> true
+        assert!(shows_unchecked_star(&row, &j_apply));
+
+        // 2. Maybe + LlmDone + form_checked=false -> true
+        row.status = Status::LlmDone;
+        assert!(shows_unchecked_star(&row, &j_maybe));
+
+        // 3. Apply + RulesDone + form_checked=true -> false
+        row.status = Status::RulesDone;
+        row.form_checked = true;
+        assert!(!shows_unchecked_star(&row, &j_apply));
+
+        // 4. No + RulesDone + form_checked=false -> false
+        row.form_checked = false;
+        assert!(!shows_unchecked_star(&row, &j_no));
+
+        // 5. Pending -> false
+        row.status = Status::Pending;
+        assert!(!shows_unchecked_star(&row, &j_apply));
+
+        // 6. Unreadable -> false
+        row.status = Status::Unreadable;
+        assert!(!shows_unchecked_star(&row, &j_maybe));
+
+        // 7. Error -> false
+        row.status = Status::Error;
+        assert!(!shows_unchecked_star(&row, &j_maybe));
+
+        // 8. Gone -> false
+        row.status = Status::Gone;
+        assert!(!shows_unchecked_star(&row, &j_no));
+
+        // 9. Note present -> false
+        row.status = Status::RulesDone;
+        row.note = Some("note".into());
+        assert!(!shows_unchecked_star(&row, &j_apply));
+    }
+
+    #[test]
+    fn test_render_table_star_verdict() {
+        let mut row1 = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        row1.form_checked = false;
+        let mut row2 = make_test_row(2, "Beta", "MLE", true, crate::db::Marks::default(), false, Status::LlmDone);
+        row2.form_checked = false;
+        let mut row3 = make_test_row(3, "Gamma", "SRE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        row3.form_checked = true;
+
+        let j1 = Judgement { verdict: Verdict::Apply, reason: "ok".into(), year_confirmed: true };
+        let j2 = Judgement { verdict: Verdict::Maybe, reason: "ask".into(), year_confirmed: false };
+        let j3 = Judgement { verdict: Verdict::Apply, reason: "ok".into(), year_confirmed: true };
+
+        let view = [
+            crate::views::ViewRow { row: &row1, judgement: j1, hint: None },
+            crate::views::ViewRow { row: &row2, judgement: j2, hint: None },
+            crate::views::ViewRow { row: &row3, judgement: j3, hint: None },
+        ];
+
+        let out = render_table(&view, false);
+        assert!(out.contains("apply*"));
+        assert!(out.contains("maybe*"));
+        assert!(out.contains("apply  "));
+
+        let out_color = render_table(&view, true);
+        assert!(out_color.contains("apply*"));
+        assert!(out_color.contains("maybe*"));
+    }
+
+    #[test]
+    fn test_json_has_form_checked_and_note() {
+        let mut row = make_test_row(1, "Acme", "SWE", true, crate::db::Marks::default(), false, Status::RulesDone);
+        row.form_checked = true;
+        row.note = Some("custom note".to_string());
+
+        let j = judge_row(&row, &profile(), 2027);
+        let view_row = crate::views::ViewRow { row: &row, judgement: j, hint: None };
+        let json_val = serde_json::to_value(&JsonOutput {
+            verdict: view_row.judgement.verdict,
+            year_confirmed: view_row.judgement.year_confirmed,
+            company: &view_row.row.job.company,
+            title: &view_row.row.job.title,
+            url: &view_row.row.job.url,
+            reason: &view_row.judgement.reason,
+            status: view_row.row.status,
+            facts: view_row.row.facts.as_ref(),
+            llm: None,
+            starred: view_row.row.marks.starred,
+            hidden: view_row.row.marks.hidden,
+            applied_at: view_row.row.marks.applied_at,
+            new: view_row.row.is_new,
+            locations: &view_row.row.locations,
+            closed: views::is_closed(view_row.row),
+            form_checked: view_row.row.form_checked,
+            note: view_row.row.note.as_deref(),
+        }).unwrap();
+
+        assert_eq!(json_val["form_checked"], true);
+        assert_eq!(json_val["note"], "custom note");
+
+        let mut row2 = row.clone();
+        row2.form_checked = false;
+        row2.note = None;
+        let view_row2 = crate::views::ViewRow { row: &row2, judgement: view_row.judgement.clone(), hint: None };
+        let json_val2 = serde_json::to_value(&JsonOutput {
+            verdict: view_row2.judgement.verdict,
+            year_confirmed: view_row2.judgement.year_confirmed,
+            company: &view_row2.row.job.company,
+            title: &view_row2.row.job.title,
+            url: &view_row2.row.job.url,
+            reason: &view_row2.judgement.reason,
+            status: view_row2.row.status,
+            facts: view_row2.row.facts.as_ref(),
+            llm: None,
+            starred: view_row2.row.marks.starred,
+            hidden: view_row2.row.marks.hidden,
+            applied_at: view_row2.row.marks.applied_at,
+            new: view_row2.row.is_new,
+            locations: &view_row2.row.locations,
+            closed: views::is_closed(view_row2.row),
+            form_checked: view_row2.row.form_checked,
+            note: view_row2.row.note.as_deref(),
+        }).unwrap();
+
+        assert_eq!(json_val2["form_checked"], false);
+        assert!(json_val2["note"].is_null());
     }
 }

@@ -225,10 +225,13 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
 
                 let mark_cell = format_mark_cell(any_starred, any_applied, any_new, all_closed);
 
-                let (verdict_str, verdict_color) = match newest.judgement.verdict {
-                    Verdict::Apply => ("apply", Color::Green),
-                    Verdict::Maybe => ("maybe", Color::Yellow),
-                    Verdict::No => ("no", Color::Red),
+                let star = crate::verdict::shows_unchecked_star(newest.row, &newest.judgement);
+                let (verdict_str, verdict_color) = match (newest.judgement.verdict, star) {
+                    (Verdict::Apply, true) => ("apply*", Color::Green),
+                    (Verdict::Apply, false) => ("apply", Color::Green),
+                    (Verdict::Maybe, true) => ("maybe*", Color::Yellow),
+                    (Verdict::Maybe, false) => ("maybe", Color::Yellow),
+                    (Verdict::No, _) => ("no", Color::Red),
                 };
 
                 let llm_span = format_llm_cell(newest.hint.as_ref());
@@ -298,10 +301,13 @@ fn render_table(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine])
                 let m = loc_row.marks();
                 let mark_cell = format_mark_cell(m.starred, m.applied_at.is_some(), loc_row.is_new(), loc_row.is_closed());
 
-                let (verdict_str, verdict_color) = match newest.judgement.verdict {
-                    Verdict::Apply => ("apply", Color::Green),
-                    Verdict::Maybe => ("maybe", Color::Yellow),
-                    Verdict::No => ("no", Color::Red),
+                let star = crate::verdict::shows_unchecked_star(newest.row, &newest.judgement);
+                let (verdict_str, verdict_color) = match (newest.judgement.verdict, star) {
+                    (Verdict::Apply, true) => ("apply*", Color::Green),
+                    (Verdict::Apply, false) => ("apply", Color::Green),
+                    (Verdict::Maybe, true) => ("maybe*", Color::Yellow),
+                    (Verdict::Maybe, false) => ("maybe", Color::Yellow),
+                    (Verdict::No, _) => ("no", Color::Red),
                 };
 
                 let llm_span = format_llm_cell(newest.hint.as_ref());
@@ -449,6 +455,25 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App, lines: &[DisplayLine]
                 spans.push(Span::raw(" ".repeat(pad)));
                 spans.push(Span::styled(loc_row.label(), Style::default().fg(Color::White)));
                 lines.push(Line::from(spans));
+            }
+
+            if let Some(ref note) = newest.row.note {
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("your note: {note}"),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
+            }
+            if crate::verdict::shows_unchecked_star(newest.row, &newest.judgement) {
+                lines.push(Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        "Form: not checked (needs a login or unreadable) — check it before you trust this",
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]));
             }
 
             let paragraph = Paragraph::new(lines).block(block);
@@ -704,12 +729,39 @@ fn render_loc_row_detail(frame: &mut Frame, area: Rect, block: Block, loc_row: &
         ]));
     }
 
+    if let Some(ref note) = newest.row.note {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                format!("your note: {note}"),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+    if crate::verdict::shows_unchecked_star(newest.row, &newest.judgement) {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Form: not checked (needs a login or unreadable) — check it before you trust this",
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let line = if let Some(ref msg) = app.status_msg {
+    let line = if let Some(ref note) = app.note_input {
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("note: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{note}_"), Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("(Enter saves · Esc cancels)", Style::default().fg(Color::DarkGray)),
+        ])
+    } else if let Some(ref msg) = app.status_msg {
         Line::from(vec![
             Span::raw(" "),
             Span::styled(msg, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -760,8 +812,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help_overlay(frame: &mut Frame, area: Rect) {
-    let width = 60.min(area.width.saturating_sub(4));
-    let height = 18.min(area.height.saturating_sub(2));
+    let width = 86.min(area.width.saturating_sub(4));
+    let height = 26.min(area.height.saturating_sub(2));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let popup_area = Rect::new(x, y, width, height);
@@ -785,6 +837,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("  A                  Open newest link and mark applied"),
         Line::from("  o                  Open posting URL in browser"),
         Line::from("  r                  Refresh jobs (sync + scan)"),
+        Line::from("  x                  Add / edit a note from the application form (makes the job no)"),
+        Line::from("  * after verdict    Form not checked (needs login or unreadable)"),
         Line::from(""),
         Line::from("  ?                  Toggle this help overlay"),
         Line::from("  q / Ctrl-C         Quit scraper browse"),
@@ -891,6 +945,8 @@ mod tests {
             is_new: false,
             locations: vec![],
             asks_location: false,
+            form_checked: false,
+            note: None,
         }
     }
 
@@ -1073,6 +1129,8 @@ mod tests {
             is_new: false,
             locations,
             asks_location: false,
+            form_checked: false,
+            note: None,
         }
     }
 
@@ -1329,5 +1387,53 @@ mod tests {
 
         assert!(!buf.contains("LLM says:"), "Detail title should not contain 'LLM says:' when no hint");
         assert!(!buf.contains("LLM:"), "Fact lines should not contain 'LLM:' when no hint");
+    }
+
+    #[test]
+    fn test_render_table_star_verdict_cell() {
+        let mut r1 = make_row(1, "AcmeCorp", "SWE", true, Marks::default());
+        r1.form_checked = false;
+        let cfg = test_config();
+        let app = App::new(vec![r1], &cfg);
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer_str = buffer_to_string(terminal.backend().buffer());
+        assert!(buffer_str.contains("apply*"));
+    }
+
+    #[test]
+    fn test_render_detail_note_and_unchecked_warning() {
+        let mut r1 = make_row(1, "AcmeCorp", "SWE", true, Marks::default());
+        r1.note = Some("too low salary".to_string());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        app.filter = VerdictFilter::All;
+        let backend = TestBackend::new(150, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer_str = buffer_to_string(terminal.backend().buffer());
+        assert!(buffer_str.contains("your note: too low salary"));
+
+        let mut r2 = make_row(2, "BetaCorp", "SWE", true, Marks::default());
+        r2.form_checked = false;
+        let app2 = App::new(vec![r2], &cfg);
+        terminal.draw(|f| render(f, &app2)).unwrap();
+        let buffer_str2 = buffer_to_string(terminal.backend().buffer());
+        assert!(buffer_str2.contains("Form: not checked (needs a login or unreadable) — check it before you trust this"));
+    }
+
+    #[test]
+    fn test_render_help_has_x_and_star() {
+        let r1 = make_row(1, "AcmeCorp", "SWE", true, Marks::default());
+        let cfg = test_config();
+        let mut app = App::new(vec![r1], &cfg);
+        app.show_help = true;
+        let backend = TestBackend::new(150, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let buffer_str = buffer_to_string(terminal.backend().buffer());
+        assert!(buffer_str.contains("x                  Add / edit a note from the application form (makes the job no)"));
+        assert!(buffer_str.contains("* after verdict"));
     }
 }

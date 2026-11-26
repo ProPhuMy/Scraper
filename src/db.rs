@@ -53,7 +53,8 @@ pub(crate) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             starred INTEGER NOT NULL DEFAULT 0,
             hidden INTEGER NOT NULL DEFAULT 0,
             applied_at INTEGER,
-            first_seen INTEGER
+            first_seen INTEGER,
+            note TEXT
         );
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
@@ -80,6 +81,9 @@ pub(crate) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     }
     if !columns.contains("llm_facts") {
         conn.execute("ALTER TABLE jobs ADD COLUMN llm_facts TEXT", [])?;
+    }
+    if !columns.contains("note") {
+        conn.execute("ALTER TABLE jobs ADD COLUMN note TEXT", [])?;
     }
 
     // Migration: split LLM facts out of `facts` into `llm_facts`
@@ -574,6 +578,20 @@ pub struct Row {
     pub is_new: bool,
     pub locations: Vec<String>,
     pub asks_location: bool,
+    pub form_checked: bool,
+    pub note: Option<String>,
+}
+
+pub fn set_note(conn: &Connection, job_id: i64, note: Option<&str>) -> anyhow::Result<()> {
+    let clean_note: Option<String> = note
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(200).collect());
+    conn.execute(
+        "UPDATE jobs SET note = ?1 WHERE id = ?2",
+        params![clean_note, job_id],
+    )?;
+    Ok(())
 }
 
 pub fn set_marks(conn: &Connection, job_id: i64, marks: Marks) -> anyhow::Result<()> {
@@ -610,7 +628,9 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
 
     let mut stmt = conn.prepare(
         "SELECT id, simplify_id, company, title, url, provider, status, facts, date_posted,
-                active, starred, hidden, applied_at, first_seen, locations, page, llm_facts
+                active, starred, hidden, applied_at, first_seen, locations, page, llm_facts,
+                note,
+                CASE WHEN page IS NOT NULL AND json_valid(page) THEN COALESCE(json_array_length(page, '$.questions'), 0) > 0 ELSE 0 END
          FROM jobs
          WHERE active = 1 OR starred = 1 OR hidden = 1 OR applied_at IS NOT NULL
          ORDER BY date_posted DESC"
@@ -634,6 +654,9 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
         let locations_str: Option<String> = row.get(14)?;
         let page_str: Option<String> = row.get(15)?;
         let llm_facts_str: Option<String> = row.get(16)?;
+        let note: Option<String> = row.get(17)?;
+        let form_checked_int: i64 = row.get(18)?;
+        let form_checked = form_checked_int != 0;
 
         let provider = Provider::parse(&provider_str);
         let status = Status::parse(&status_str);
@@ -684,12 +707,14 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
             locations,
             asks_location,
             llm_facts_str,
+            form_checked,
+            note,
         ))
     })?;
 
     let mut result = Vec::new();
     for r in rows {
-        let (job, status, facts_str, date_posted, active, marks, is_new, locations, asks_location, llm_facts_str) = r?;
+        let (job, status, facts_str, date_posted, active, marks, is_new, locations, asks_location, llm_facts_str, form_checked, note) = r?;
         let facts = match facts_str {
             Some(s) => Some(
                 serde_json::from_str::<Facts>(&s)
@@ -711,6 +736,8 @@ pub fn list_jobs(conn: &Connection) -> anyhow::Result<Vec<Row>> {
             is_new,
             locations,
             asks_location,
+            form_checked,
+            note,
         });
     }
 
@@ -1863,5 +1890,145 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_init_schema_migration_note_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY,
+                simplify_id TEXT UNIQUE NOT NULL,
+                company TEXT NOT NULL,
+                title TEXT NOT NULL,
+                category TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                url TEXT NOT NULL,
+                locations TEXT NOT NULL,
+                date_posted INTEGER NOT NULL,
+                date_updated INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                page TEXT,
+                facts TEXT,
+                scanned_at INTEGER
+            );"
+        ).unwrap();
+
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA table_info(jobs)").unwrap();
+        let cols: HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(cols.contains("note"));
+    }
+
+    #[test]
+    fn test_set_note_roundtrip_and_trim() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        upsert_jobs(&mut c, &[a]).unwrap();
+
+        set_note(&c, 1, Some("  my test note  ")).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows[0].note, Some("my test note".to_string()));
+
+        set_note(&c, 1, Some("   \t  ")).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows[0].note, None);
+
+        set_note(&c, 1, None).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows[0].note, None);
+    }
+
+    #[test]
+    fn test_set_note_non_ascii_and_cap() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        upsert_jobs(&mut c, &[a]).unwrap();
+
+        let vietnamese_str = "yêu cầu kinh nghiệm – thực tập sinh khóa 2027";
+        set_note(&c, 1, Some(vietnamese_str)).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows[0].note, Some(vietnamese_str.to_string()));
+
+        let long_note = "é".repeat(250);
+        set_note(&c, 1, Some(&long_note)).unwrap();
+        let rows = list_jobs(&c).unwrap();
+        let note = rows[0].note.as_ref().unwrap();
+        assert_eq!(note.chars().count(), 200);
+        assert_eq!(note, &"é".repeat(200));
+    }
+
+    #[test]
+    fn test_upsert_jobs_keeps_note() {
+        let mut c = open_in_memory().unwrap();
+        let a = nj("a", 100);
+        upsert_jobs(&mut c, &[a]).unwrap();
+
+        set_note(&c, 1, Some("keep this note")).unwrap();
+
+        let a_newer = nj("a", 200);
+        let stats = upsert_jobs(&mut c, &[a_newer]).unwrap();
+        assert_eq!(stats.requeued, 1);
+
+        let rows = list_jobs(&c).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, Status::Pending);
+        assert_eq!(rows[0].note, Some("keep this note".to_string()));
+    }
+
+    #[test]
+    fn test_form_checked_sql() {
+        let mut c = open_in_memory().unwrap();
+        let j1 = nj("j1", 100);
+        let j2 = nj("j2", 100);
+        let j3 = nj("j3", 100);
+        let j4 = nj("j4", 100);
+        let j5 = nj("j5", 100);
+        upsert_jobs(&mut c, &[j1, j2, j3, j4, j5]).unwrap();
+
+        // j1: page is NULL (default after upsert)
+
+        // j2: page is invalid JSON
+        c.execute("UPDATE jobs SET page = '{not json' WHERE simplify_id = 'j2'", []).unwrap();
+
+        // j3: questions is empty array
+        c.execute(
+            "UPDATE jobs SET page = ?1 WHERE simplify_id = 'j3'",
+            params![r#"{"description":"desc","questions":[]}"#],
+        ).unwrap();
+
+        // j4: questions has 1 item
+        c.execute(
+            "UPDATE jobs SET page = ?1 WHERE simplify_id = 'j4'",
+            params![r#"{"description":"desc","questions":[{"label":"q1","options":[]}]}"#],
+        ).unwrap();
+
+        // j5: no questions field
+        c.execute(
+            "UPDATE jobs SET page = ?1 WHERE simplify_id = 'j5'",
+            params![r#"{"description":"desc"}"#],
+        ).unwrap();
+
+        let rows = list_jobs(&c).unwrap();
+        let r1 = rows.iter().find(|r| r.job.simplify_id == "j1").unwrap();
+        let r2 = rows.iter().find(|r| r.job.simplify_id == "j2").unwrap();
+        let r3 = rows.iter().find(|r| r.job.simplify_id == "j3").unwrap();
+        let r4 = rows.iter().find(|r| r.job.simplify_id == "j4").unwrap();
+        let r5 = rows.iter().find(|r| r.job.simplify_id == "j5").unwrap();
+
+        assert!(!r1.form_checked);
+        assert!(!r2.form_checked);
+        assert!(!r3.form_checked);
+        assert!(r4.form_checked);
+        assert!(!r5.form_checked);
     }
 }

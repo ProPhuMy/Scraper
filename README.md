@@ -95,6 +95,7 @@ A terminal UI with tabs for **Jobs**, **Starred**, **Applied** and **Hidden**, p
 | `y` | try another class year |
 | `Enter` / `→` `←` | expand or collapse a `×N` group |
 | `s` / `h` / `a` | star, hide, mark applied (press again to undo) |
+| `x` | add / edit a note from the application form (makes the job no) |
 | `o` | open the job page in your browser |
 | `A` | open the job page **and** mark it applied |
 | `r` | refresh: sync + scan in the background with live progress |
@@ -102,6 +103,8 @@ A terminal UI with tabs for **Jobs**, **Starred**, **Applied** and **Hidden**, p
 
 - **Grouping:** the same job posted in several cities shows as one `×N` row. Expand it to pick a location. Duplicate links for one location merge into a single row, e.g. `Salt Lake City, UT (2 links)`.
 - **Marks:** your marks are saved immediately and survive re-syncs. Applied and starred jobs stay in their tabs even after the posting closes.
+- **Notes (`x`):** record free-text notes from the application form (e.g. GPA requirement or sponsorship blocker). Adding a note sets the verdict to `no` across all locations in a group and survives syncs.
+- **Form marker `*`:** an asterisk (`apply*`, `maybe*`) shows when the application form wasn't checked (login required or unreadable) — check the form before trusting the verdict.
 - **Badges** in the MARK column: `★` starred, `✓` applied, `N` new since the last sync, `✗` closed (Simplify dropped it, or the page is gone).
 - **LLM column:** shows a second opinion (`apply`, `maybe` or `no`, dimmed) when the LLM was asked to clarify vague wording, leaving the main VERDICT rules-only.
 
