@@ -125,6 +125,7 @@ For each job, `scraper` extracts five facts: accepted class years, GPA, visa spo
 - **no**: an explicit conflict, for example "must not require sponsorship now or in the future", "active security clearance required", "graduating between Dec 2027 and Jun 2028" when you graduate in 2030, or a stated GPA minimum above yours.
 - **maybe**: something is unclear or only asked about (for example a form asks about sponsorship without refusing it, or the page needs JavaScript and couldn't be read).
 - **apply**: nothing in the posting blocks you.
+- **apply\*** / **maybe\***: same verdict, but the application form couldn't be read (it needs a login, as on Workday, UltiPro and Oracle, or the site hides it). Open the form and check it yourself before you trust the verdict. If it shows a blocker, press `x` in `browse` to note it.
 
 The rules lean toward **maybe** when unsure, because wrongly hiding a job you could have gotten is worse than showing one to double-check.
 
